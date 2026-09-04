@@ -3906,7 +3906,9 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
           return fn.apply(inst, decoded.args);
         }, true);
       } finally {
-        for (const handle of decoded.received) __disposeStub(handle);
+        // EXPERIMENT (horizon-loong fork): stub args delivered to the callee
+        // are OWNED by it (Workerd transfers the capability). The old dispose
+        // here raced with the callee's use and killed tunnelled stubs.
       }
     })());
   } finally {
