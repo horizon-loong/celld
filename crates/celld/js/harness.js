@@ -3130,9 +3130,16 @@ const __stubOp = (meta, path, args) => {
           return await __rpcWalk(entry.target, path,
             decoded === null ? null : decoded.args, false);
         } finally {
-          if (decoded !== null)
-            for (const handle of decoded.received)
-              __disposeStub(handle);
+          // EXPERIMENT (horizon-loong fork): do NOT dispose received stub
+          // handles at event end. Callees legitimately keep received stubs
+          // alive across events -- cloudflare-os's chat subscription hands a
+          // browser-side subscriber to the Overseer DO, which pushes events
+          // through it long after the subscribe call returns. Disposing here
+          // broke every later push with "This RpcImportHook was already
+          // disposed". Callers/callees now own explicit disposal
+          // (Symbol.dispose / dup), matching Workerd's capability model; a
+          // callee that never disposes leaks an entry until its context
+          // ends, which is the honest cost of keeping the capability usable.
         }
       }, true));
     if (__abortedCtxs.size !== 0) {
@@ -3906,7 +3913,12 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
           return fn.apply(inst, decoded.args);
         }, true);
       } finally {
-        for (const handle of decoded.received) __disposeStub(handle);
+        // EXPERIMENT (horizon-loong fork): received stubs are OWNED by the
+        // callee now. Workerd transfers stub capabilities to the receiving
+        // context; the old unconditional dispose here broke callees that
+        // keep received stubs across events (chat subscribers), because the
+        // caller-side dispose raced past the callee's dup() (refcounts do
+        // not propagate across the boundary). Callees dispose explicitly.
       }
     })());
   } finally {
@@ -4189,8 +4201,8 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
     if (reply[0] !== 1) __ctxEnd(id);
     return reply;
   } finally {
-    if (decoded !== null)
-      for (const handle of decoded.received) __disposeStub(handle);
+    // EXPERIMENT (horizon-loong fork): received stubs are owned by the
+    // callee; see __dispatchRpc. Explicit disposal only.
   }
 })());
 };
