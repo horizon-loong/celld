@@ -1413,6 +1413,7 @@ class DurableObjectStorage {
       this._transactionSerial = 0;
       this._transactionTail = Promise.resolve();
       this._syncKvListGeneration = 0;
+      this._syncTxActive = false;
     }
     this._kv = new SyncKvStorage(this);
   }
@@ -1551,20 +1552,38 @@ class DurableObjectStorage {
     }
   }
   transactionSync(f) {
-    const savepoint = this._transactionStart();
+    // EXPERIMENT (horizon-loong fork): support nesting. Workerd tolerates
+    // `transactionSync` inside an open transaction (typed-storage wrappers
+    // legitimately nest puts that notify subscribers); celld used to issue a
+    // root BEGIN for every outermost-per-wrapper call, which collided with
+    // any already-open transaction ("cannot start a transaction within a
+    // transaction"). Track sync-transaction liveness on the shared root and
+    // take a SAVEPOINT whenever a transaction (sync or async) is already
+    // active.
+    const root = this._transactionRoot;
+    const wasActive = root._syncTxActive === true;
+    const nested = this._transactionDepth > 0 || wasActive;
+    const savepoint = "cells_tx_" + (++root._transactionSerial);
+    __storage_transaction_control(this._scope, "start", nested, savepoint);
     const control = {
       rolledBack: false,
-      rollback: () => this._transactionRollback(savepoint, true),
+      rollback: () => __storage_transaction_control(
+        this._scope, "rollback_explicit", nested, savepoint),
     };
+    if (!nested) root._syncTxActive = true;
     try {
       const value = f(this._transactionView(control));
-      if (!control.rolledBack) this._transactionCommit(savepoint);
+      if (!control.rolledBack) {
+        __storage_transaction_control(this._scope, "commit", nested, savepoint);
+      }
       return value;
     } catch (error) {
       if (!control.rolledBack) {
-        try { this._transactionRollback(savepoint); } catch {}
+        try { control.rollback(); } catch {}
       }
       throw error;
+    } finally {
+      if (!nested) root._syncTxActive = wasActive;
     }
   }
   async _runTransaction(f) {
@@ -8674,6 +8693,19 @@ globalThis.__cf = {
   },
   exports: {},
   get env() { return globalThis.__cell.env; },
+  // Workers beta tracing API (`tracing.enterSpan`). celld has no span
+  // collector wired up yet, so spans report isTraced=false and attributes
+  // are dropped — but the callback always runs, matching workerd's
+  // behavior when tracing is not enabled for the deployment.
+  tracing: {
+    enterSpan(name, callback) {
+      const span = {
+        isTraced: false,
+        setAttribute() {},
+      };
+      return callback(span);
+    },
+  },
 };
 // Pass-through proxy standing in for unsupported node:* builtins: callable,
 // constructable, and every property returns itself — so bundle evaluation

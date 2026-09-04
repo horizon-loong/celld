@@ -2963,8 +2963,22 @@ impl InFlight {
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
     /// alive after the handler ends, but explicit `waitUntil` work can.
+    ///
+    /// EXPERIMENT (horizon-loong fork): always keep native ops. The previous
+    /// reply/background gate silently dropped (and aborted) every op started
+    /// after the handler settled, which breaks any promise library that
+    /// processes work from detached continuations — Cap'n Web's WebSocket
+    /// session being the motivating case: its readLoop invokes RPC methods in
+    /// the microtasks after the runtime event returns, so every method that
+    /// touched storage or timers hung forever. Dropping also left SQLite
+    /// transactions open on the cell connection (the JS-side depth bookkeeping
+    /// died with the dropped continuation), poisoning later events with
+    /// "cannot start a transaction within a transaction". We now adopt and
+    /// drive every started op until it completes; an op that never completes
+    /// keeps its drive loop alive, which is the honest reading of "this event
+    /// still has work outstanding".
     pub(crate) fn keeps_native_ops(&self) -> bool {
-        self.reply.is_some() || self.background.is_some()
+        true
     }
 
     /// Whether a client can still disconnect from this request. A request
