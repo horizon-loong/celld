@@ -5828,6 +5828,36 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
         return Vec::new();
     }
     settle(tc, entry);
+    // horizon-loong fork: a waitUntil registered after the frame was popped
+    // (deferred work chained onto this settling event) is invisible to the
+    // aggregate captured at reply time. Fold it into a fresh aggregate so
+    // the event stays driven until the late work settles too; otherwise the
+    // late work's ops are aborted with the entry and the chain hangs.
+    let late = entry.context.take_ended_wait_until();
+    if !late.is_empty() {
+        let promises: Vec<v8::Local<v8::Value>> = late
+            .iter()
+            .map(|promise| v8::Local::new(tc, promise).into())
+            .collect();
+        let array = v8::Array::new_with_elements(tc, &promises);
+        if let Some(aggregate) = all_settled(tc, array.into()) {
+            let combined = match entry.background.as_ref() {
+                Some(previous) => {
+                    let pair = v8::Array::new_with_elements(tc, &[
+                        v8::Local::new(tc, previous).into(),
+                        aggregate.into(),
+                    ]);
+                    all_settled(tc, pair.into())
+                }
+                None => Some(aggregate),
+            };
+            if let Some(background) = combined {
+                if let Ok(as_promise) = background.try_cast::<v8::Promise>() {
+                    entry.background = Some(v8::Global::new(tc, as_promise));
+                }
+            }
+        }
+    }
     let ops = adopt(entry);
     // 6. **close the request's sockets** — see above.
     if entry.retired() {
@@ -11440,6 +11470,14 @@ struct IoEventState {
     frames: Vec<IoEventFrame>,
     ended_arm_gates: Vec<ArmGateRx>,
     arm_gates_sealed: bool,
+    // horizon-loong fork: waitUntil promises registered after this event's
+    // frame was popped. `end_event` hands the frame's promises to the driver
+    // once, at reply time; a registration that lands later (deferred work
+    // chained onto an already-settling event) used to be dropped on the
+    // floor, so the work hung forever. The driver harvests this queue in
+    // `finish_turn` and folds it back into the entry's background aggregate,
+    // keeping the event — and the late work's own ops — alive.
+    ended_wait_until: Vec<v8::Global<v8::Promise>>,
 }
 
 /// The writable directory subset of Workerd's per-request virtual filesystem.
@@ -11841,9 +11879,23 @@ impl IoContext {
     }
 
     fn register_wait_until(&self, promise: v8::Global<v8::Promise>) {
-        if let Some(frame) = self.events.lock().unwrap().frames.last_mut() {
-            frame.wait_until.push(promise);
+        let mut events = self.events.lock().unwrap();
+        match events.frames.last_mut() {
+            Some(frame) => frame.wait_until.push(promise),
+            // horizon-loong fork: the frame is already popped, but the event
+            // is not necessarily finished — background continuations register
+            // late all the time (a finished run's finally starting the next
+            // turn). Keep them; `finish_turn` harvests this queue.
+            None => events.ended_wait_until.push(promise),
         }
+    }
+
+    /// Take waitUntil promises registered after this event's frame ended.
+    /// Empty almost always; non-empty means the driver must re-arm the
+    /// entry's background aggregate so the late work keeps being driven.
+    fn take_ended_wait_until(&self) -> Vec<v8::Global<v8::Promise>> {
+        let mut events = self.events.lock().unwrap();
+        std::mem::take(&mut events.ended_wait_until)
     }
 
     fn register_arm_gate(&self, gate: ArmGateRx) -> Result<(), ArmGateRx> {
