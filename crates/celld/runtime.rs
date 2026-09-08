@@ -2931,6 +2931,29 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // disconnect no longer matters, but a lifecycle cancellation
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
+                // horizon-loong fork: an empty adopted-op set does NOT mean a
+                // cell event with pending background work is done. A waitUntil
+                // continuation can suspend on pure-JavaScript promises and
+                // spawn its next op only after a later isolate entry pumps it;
+                // declaring "waiting on nothing" at that instant fails the
+                // event and aborts the very op the background was about to
+                // spawn (an agent run restarted from a finished run's finally
+                // hung its model call exactly here, intermittently). When
+                // background work remains, poll on a tick so late spawns are
+                // adopted and driven.
+                if ops.is_empty() && !entry.has_pending_background() {
+                    return match ops.next().await {
+                        Some((op, result)) => Wake::Op(op, result),
+                        None => Wake::Idle,
+                    };
+                }
+                if ops.is_empty() {
+                    asyncrt::sleep(CANCELLATION_TICK).await;
+                    if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
+                        return cancelled;
+                    }
+                    return Wake::Poll;
+                }
                 return match ops.next().await {
                     Some((op, result)) => Wake::Op(op, result),
                     None => Wake::Idle,

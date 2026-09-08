@@ -5289,6 +5289,15 @@ impl InFlight {
         self.reply.is_none() && self.gated_reply.is_none()
     }
 
+    /// horizon-loong fork: whether waitUntil work is still registered for
+    /// this event. An empty adopted-op set alongside pending background is
+    /// not "waiting on nothing": the background's next op may not have been
+    /// spawned (or adopted) yet, so the driver must keep polling instead of
+    /// failing the event.
+    pub fn has_pending_background(&self) -> bool {
+        self.background.is_some()
+    }
+
     /// Whether a native operation can still resume JavaScript for this event.
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
