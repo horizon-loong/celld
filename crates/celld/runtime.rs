@@ -40,6 +40,9 @@ const REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// blocking run loop's own cap, which exists for the same reason: a client
 /// disconnect is raised on another thread and has nothing to wake this one.
 const CANCELLATION_TICK: Duration = Duration::from_millis(10);
+/// horizon-loong fork: cap for the background-poll backoff in the cell drive
+/// loop (10ms eager start, doubling to this cap).
+const MAX_BACKGROUND_POLL: Duration = Duration::from_millis(500);
 const CLEAN_RELOAD_MARKER: &str = ".clean-reload.json";
 /// Cell fetches that one target can hold before celld refuses excess work.
 ///
@@ -2764,9 +2767,17 @@ async fn drive_affiliated_inner(
         timing.answered(&entry);
     }
 
+    // horizon-loong fork: a background-only event (reply answered, waitUntil
+    // work pending, no adopted ops yet) is woken by polling, because its
+    // continuations can spawn ops with nothing else to wake the driver. Poll
+    // eagerly at first so chains stay low-latency, then back off so a
+    // long-lived background event costs a handful of isolate entries per
+    // second rather than a busy loop.
+    let mut poll_delay = CANCELLATION_TICK;
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await {
             Wake::Op(op, result) => {
+                poll_delay = CANCELLATION_TICK;
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
             }
@@ -2858,10 +2869,11 @@ async fn wake_with_cross_entry_gate(
     ops: &mut Ops,
     entry: &mut js::InFlight,
     budget: Duration,
+    poll_delay: &mut Duration,
 ) -> Wake {
     let wait = entry.prepare_cross_entry_gate_wait();
     match wait
-        .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
+        .wait(wake(ops, entry, budget, poll_delay), |wake| matches!(wake, Wake::Idle))
         .await
     {
         js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
@@ -2869,7 +2881,12 @@ async fn wake_with_cross_entry_gate(
     }
 }
 
-async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
+async fn wake(
+    ops: &mut Ops,
+    entry: &mut js::InFlight,
+    budget: Duration,
+    poll_delay: &mut Duration,
+) -> Wake {
     loop {
         let Some(left) = entry.remaining(budget) else {
             // The handler settled, so neither its reply gate nor waitUntil
@@ -2948,7 +2965,8 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                     };
                 }
                 if ops.is_empty() {
-                    asyncrt::sleep(CANCELLATION_TICK).await;
+                    asyncrt::sleep(*poll_delay).await;
+                    *poll_delay = (*poll_delay * 2).min(MAX_BACKGROUND_POLL);
                     if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
                         return cancelled;
                     }
@@ -3455,7 +3473,8 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
         abort_ops(&mut ops, &mut entry);
     }
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+            let mut poll_delay = CANCELLATION_TICK;
+    let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -3908,7 +3927,8 @@ async fn drive_cell_inner(
     }
 
     while !entry.finished() {
-        let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
+            let mut poll_delay = CANCELLATION_TICK;
+    let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await
         {
             Wake::Op(op, result) => {
                 slot.turn(|worker| {
