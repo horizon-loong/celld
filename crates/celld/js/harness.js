@@ -4140,8 +4140,12 @@ const __stubBridgeInvoke = (method, payload) => {
   }
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
   const args = decoded === null ? null : decoded.args;
+  // horizon-loong fork: re-root the op in THIS dispatch event's context.
+  // entry.ctx belongs to the long-finished event that received the stub
+  // (e.g. the facet's subscribe call); routing through it rejected every
+  // later push as post-abort, silently killing gadget UI updates.
   return __stubOp(
-    { entry, callable: false, disposed: false, ctx: entry.ctx },
+    { entry, callable: false, disposed: false, ctx: __ctxNow() },
     path, args,
   ).finally(() => {
     if (decoded !== null)
@@ -4265,7 +4269,11 @@ const __storedLift = (value) => {
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       lifted = true;
-      const marker = { "__celld$svc": svc.name };
+      // horizon-loong fork: record the owning script. A stored loopback is
+      // revived possibly in ANOTHER script's isolate (a gadget facet), where
+      // the local entrypoint table has no such name — routing it through the
+      // foreign service bridge (by script + name) is the only correct path.
+      const marker = { "__celld$svc": svc.name, c: __cell.script };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
@@ -4316,8 +4324,15 @@ const __storedRevive = (value) => {
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
     const svcName = v["__celld$svc"];
-    if (svcName !== undefined)
+    if (svcName !== undefined) {
+      // horizon-loong fork: a marker owned by another script revives as a
+      // bridged service stub (script + name + props), not as a local
+      // entrypoint — the storing isolate (e.g. a gadget facet) has no such
+      // entrypoint, and every call on a local stub would reject immediately.
+      if (typeof v.c === "string" && v.c !== "" && v.c !== __cell.script)
+        return __makeForeignSvcStub(v.c, svcName, v.p);
       return __entrypointStub(svcName, revive(v.p));
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined)
       return __cell.makeNamespace(doClass).get(
