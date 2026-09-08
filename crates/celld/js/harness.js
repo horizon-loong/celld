@@ -1587,6 +1587,12 @@ class DurableObjectStorage {
       this._transactionSerial = 0;
       this._transactionTail = Promise.resolve();
       this._syncKvListGeneration = 0;
+      // EXPERIMENT (horizon-loong fork): tracks a live root synchronous
+      // transaction on the shared root, so a second transactionSync() on the
+      // SAME root object (typed-storage wrappers call ctx.storage directly,
+      // not the transaction view) takes a SAVEPOINT instead of a second
+      // BEGIN. Workerd tolerates this nesting; celld 0.4.1 did not.
+      this._syncTxActive = false;
     }
     this._kv = new SyncKvStorage(this);
   }
@@ -1727,24 +1733,25 @@ class DurableObjectStorage {
     if (!this._flushPendingPuts()) return;
     __alarm_delete(this._scope);
   }
-  _transactionStart() {
+  _transactionStart(nested = this._transactionDepth > 0) {
     const root = this._transactionRoot;
     const savepoint = "cells_tx_" + (++root._transactionSerial);
     __storage_transaction_control(
-      this._scope, "start", this._transactionDepth > 0, savepoint,
+      this._scope, "start", nested, savepoint,
     );
     return savepoint;
   }
-  _transactionCommit(savepoint) {
+  _transactionCommit(savepoint, nested = this._transactionDepth > 0) {
     __storage_transaction_control(
-      this._scope, "commit", this._transactionDepth > 0, savepoint,
+      this._scope, "commit", nested, savepoint,
     );
   }
-  _transactionRollback(savepoint, explicit = false) {
+  _transactionRollback(savepoint, explicit = false,
+                       nested = this._transactionDepth > 0) {
     __storage_transaction_control(
       this._scope,
       explicit ? "rollback_explicit" : "rollback",
-      this._transactionDepth > 0,
+      nested,
       savepoint,
     );
   }
@@ -1768,25 +1775,35 @@ class DurableObjectStorage {
   }
   transactionSync(f) {
     this._assertTransactionActive("transactionSync");
-    const savepoint = this._transactionStart();
-    const control = this._newTransactionControl(savepoint);
+    // EXPERIMENT (horizon-loong fork): see the constructor note — a root
+    // BEGIN may already be live on this same object.
+    const root = this._transactionRoot;
+    const wasActive = root._syncTxActive === true;
+    const nested = this._transactionDepth > 0 || wasActive;
+    if (!nested) root._syncTxActive = true;
     try {
-      const value = f(this._transactionView(control));
-      if (!control.rolledBack) {
-        this._transactionCommit(savepoint);
-        control.committed = true;
-      }
-      return value;
-    } catch (error) {
-      if (!control.rolledBack) {
-        try {
-          this._transactionRollback(savepoint);
-          control.rolledBack = true;
-        } catch (rollbackError) {
-          this._abortAfterFailedRollback(rollbackError, error);
+      const savepoint = this._transactionStart(nested);
+      const control = this._newTransactionControl(savepoint);
+      try {
+        const value = f(this._transactionView(control));
+        if (!control.rolledBack) {
+          this._transactionCommit(savepoint, nested);
+          control.committed = true;
         }
+        return value;
+      } catch (error) {
+        if (!control.rolledBack) {
+          try {
+            this._transactionRollback(savepoint, false, nested);
+            control.rolledBack = true;
+          } catch (rollbackError) {
+            this._abortAfterFailedRollback(rollbackError, error);
+          }
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      if (!nested) root._syncTxActive = wasActive;
     }
   }
   _newTransactionControl(savepoint) {
@@ -3352,7 +3369,17 @@ const __stubLift = (value) => {
     if (typeof v === "function" || v instanceof __cf.RpcTarget) {
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
+      // EXPERIMENT (horizon-loong fork): a capnweb stub crossing to the
+      // native side takes an INDEPENDENT reference on its underlying import
+      // hook (dup bumps localRefcount). Cap'n Web's payload dispose releases
+      // the delivered payload's refs right after a call; without this dup
+      // the browser-side binding died while the native callee (a DO holding
+      // a chat subscription) still routed pushes through it.
+      let held = v;
+      try {
+        if (typeof held.dup === "function") held = held.dup();
+      } catch {}
+      const marker = { "__celld$stub": __newEntry(held).id,
                        t: __stubIsolate,
                        c: typeof v === "function" };
       seen.set(v, marker);
@@ -3884,7 +3911,18 @@ const __makeStub = (entry, callable) => {
         entry.refs++;
         return __makeStub(entry, callable);
       };
+      // EXPERIMENT (horizon-loong fork): Object.prototype introspection
+      // members answer locally, exactly like Workerd's native stubs. Turning
+      // them into RPC paths broke callers that merely introspect a stub
+      // (deep-copy, validation wrappers): the receiving RpcTarget rejects
+      // `constructor` ("in Object.prototype") and the TypeError killed the
+      // whole call (cloudflare-os workspace open).
       if (typeof prop !== "string") return undefined;
+      if (prop === "constructor" || prop === "toString" ||
+          prop === "valueOf" || prop === "hasOwnProperty" ||
+          prop === "propertyIsEnumerable" || prop === "toLocaleString") {
+        return Reflect.get(_b, prop, _b);
+      }
       return __makeNode(__stubSession(meta), [prop], __ctxNow());
     },
     apply: (_b, _this, args) => __makeNode(
@@ -4086,6 +4124,7 @@ const __rpcOut = (value, lift) => {
 // A callee exception as tagged bytes: the Error crosses by value
 // (V8 serializes Error natively), custom own properties beside it.
 const __rpcErrOut = (error) => {
+  console.error("[celld-dbg] RPC error reply: " + (error?.stack ?? error));
   // `name` rides in the props: V8 only round-trips the standard
   // Error subclass names, and e.g. DataCloneError must survive.
   const props = error instanceof Error
@@ -9407,6 +9446,16 @@ globalThis.__cf = {
   },
   exports: {},
   get env() { return globalThis.__cell.env; },
+  // EXPERIMENT (horizon-loong fork): Workers beta tracing API. celld has no
+  // span collector, so spans report isTraced=false and attributes are
+  // dropped — the callback always runs, matching Workerd when tracing is
+  // off. cloudflare-os's backend-utils tracing.ts requires this export.
+  tracing: {
+    enterSpan(name, callback) {
+      const span = { isTraced: false, setAttribute() {} };
+      return callback(span);
+    },
+  },
 };
 // Proxy standing in for unsupported node:*/cloudflare:* builtins. Property
 // walks stay inert — real bundles reference these at module scope, and
