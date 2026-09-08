@@ -4116,6 +4116,8 @@ const __makeBridgeStub = (meta) => {
 // ask the owning cell to run it. The reply is tagged RPC bytes, so the
 // caller decodes with __rpcDes exactly like a local dispatch.
 const __stubBridge = (meta, path, args) => {
+  console.error(`[celld-dbg] stub bridge send: entryId=${meta.entryId} ` +
+    `path=${JSON.stringify(path)} argsNull=${args === null}`);
   const argsSc = args === null ? null : __rpcOut(args, true);
   return __stub_bridge(
     meta.scope, meta.entryId, "__celld$stub:invoke",
@@ -4182,6 +4184,13 @@ const __entrypointStub = (name, props) => {
     get: (_b, prop) => {
       if (prop === "then") return undefined;
       if (typeof prop !== "string") return undefined;
+      // horizon-loong fork: dup is stub protocol, not an RPC method. Workerd's
+      // native stubs answer it synchronously; bridging it as a pipelined call
+      // both violates that contract (callers store the return value without
+      // awaiting) and wires the new handle's creation to this event's egress
+      // gate — an event that typically ends before the reply arrives, so every
+      // later call through the dup'd handle rejected.
+      if (prop === "dup") return () => __entrypointStub(name, props);
       if (prop === "getRpcMethodForTestOnly")
         return (n) => __makeNode(session, [String(n)], null);
       const probe = __probeLocal(prop);
@@ -4225,6 +4234,11 @@ const __makeForeignSvcStub = (script, name, propsMarker) => {
     get: (_b, prop) => {
       if (prop === "then") return undefined;
       if (typeof prop !== "string") return undefined;
+      // horizon-loong fork: dup is stub protocol, not an RPC method — mirror
+      // __entrypointStub and mint locally. The wire round-trip hung the fresh
+      // handle's birth on the *caller's* egress gate, so a dup() fired from a
+      // just-ending event produced a handle whose every later call rejected.
+      if (prop === "dup") return () => __makeForeignSvcStub(script, name, propsMarker);
       const probe = __probeLocal(prop);
       if (probe !== null) return probe;
       return __makeNode(session, [prop], null);

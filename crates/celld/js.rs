@@ -8326,7 +8326,14 @@ fn op_svc_rpc(
         props_json,
         reply: tx,
     };
-    let id = asyncrt::enqueue(async move {
+    // horizon-loong fork: an IoContext-lifetime op, not a handler op. The
+    // request driver only polls handler ops while their event is being driven,
+    // so a fire-and-forget call (a gadget notifying a registered chat callback)
+    // was dropped the moment its event replied — stuck forever on the egress
+    // gate with no dispatch and no rejection. Workerd holds the IoContext for
+    // an outgoing RPC until it settles; the io_context lifetime is that
+    // contract here, and it is what keeps_native_ops honors.
+    let id = asyncrt::enqueue_io_context(async move {
         gated_channel_send(gate, &SVC_RPC_TX, request, "no service binding channel").await?;
         match rx.await {
             Ok(Ok(result)) => Ok(result),
@@ -9352,7 +9359,10 @@ fn op_stub_bridge(
         args: payload,
         reply: tx,
     };
-    let id = asyncrt::enqueue(async move {
+    // horizon-loong fork: IoContext lifetime, like op_svc_rpc — a stub bridge
+    // call is an egress effect that must survive its event (gadget UI pushes
+    // fire-and-forget their `update` calls from an already-replied event).
+    let id = asyncrt::enqueue_io_context(async move {
         gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
         match rx.await {
             Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
