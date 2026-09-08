@@ -618,10 +618,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         if let Some(name) = config.loader_binding.as_deref() {
             lines.push_str(&format!("e[{:?}] = __makeLoader();\n", name));
         }
-        // A loaded worker's caller-supplied `env` (plain JSON values only in
-        // the walking skeleton) merges last, over the declared bindings.
+        // A loaded worker's caller-supplied `env` (plain JSON values plus
+        // stub markers) merges last, over the declared bindings. Markers
+        // revive through __celldStubRevive so capability stubs become live
+        // in the loaded isolate.
         if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, {});\n", env));
+            lines.push_str(&format!(
+                "Object.assign(e, __celldStubRevive(JSON.parse({:?})));\n",
+                env
+            ));
         }
         lines.push_str("})();");
         lines

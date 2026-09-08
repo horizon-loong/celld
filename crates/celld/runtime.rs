@@ -1724,12 +1724,13 @@ impl RuntimeManager {
         entrypoint: String,
         method: String,
         args: Vec<u8>,
+        props_json: Option<String>,
     ) -> anyhow::Result<Vec<u8>> {
         let generation = self.generation_by_id(generation);
         generation
             .service(script)
             .ok_or_else(|| anyhow!("no service Worker for script {script}"))?
-            .rpc(entrypoint, method, args)
+            .rpc(entrypoint, method, args, props_json)
             .await
     }
 
@@ -3293,11 +3294,13 @@ impl StatelessRuntime {
         entrypoint: String,
         method: String,
         args: Vec<u8>,
+        props_json: Option<String>,
     ) -> anyhow::Result<Vec<u8>> {
         self.dispatch(StatelessVerb::Rpc, move |reply| crate::WorkerJob::Rpc {
             entrypoint,
             method,
             args,
+            props_json,
             reply,
         })
         .await

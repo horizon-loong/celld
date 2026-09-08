@@ -330,6 +330,8 @@ pub struct SvcRpcReq {
     pub entrypoint: String,
     pub method: String,
     pub args: Vec<u8>,
+    /// JSON marker tree for the entrypoint instance's props, if any.
+    pub props_json: Option<String>,
     pub reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 }
 static SVC_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcRpcReq>> = OnceLock::new();
@@ -5873,8 +5875,10 @@ fn begin<'s>(
             entrypoint,
             method,
             args,
+            props_json,
             reply,
-        } => return begin_entrypoint_rpc(tc, &entrypoint, &method, args, reply),
+        } => return begin_entrypoint_rpc(
+            tc, &entrypoint, &method, args, props_json.as_deref(), reply),
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
@@ -5952,6 +5956,7 @@ fn begin_entrypoint_rpc(
     entrypoint: &str,
     method: &str,
     args: Vec<u8>,
+    props_json: Option<&str>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
     let context = IoContext::new();
@@ -5967,10 +5972,14 @@ fn begin_entrypoint_rpc(
         let entrypoint = v8::String::new(tc, entrypoint).unwrap();
         let method = v8::String::new(tc, method).unwrap();
         let args = bytes_value(tc, args);
+        let props = match props_json {
+            Some(json) => v8::String::new(tc, json).unwrap().into(),
+            None => v8::null(tc).into(),
+        };
         let recv = v8::undefined(tc).into();
         begin_event_context(tc)?;
         let ret = f
-            .call(tc, recv, &[entrypoint.into(), method.into(), args])
+            .call(tc, recv, &[entrypoint.into(), method.into(), args, props])
             .ok_or_else(|| anyhow!("entrypoint RPC threw"))?;
         match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok(promise),
@@ -7222,15 +7231,30 @@ impl Worker {
 
             // entry fetch
             let dk = v8::String::new(scope, "default").unwrap();
-            let default = ns
+            let is_loader_script = script_name.starts_with("__loader:");
+            let default_raw = ns
                 .get(scope, dk.into())
-                .ok_or_else(|| anyhow!("no default export"))?
-                .to_object(scope)
-                .ok_or_else(|| anyhow!("default not object"))?;
+                .ok_or_else(|| anyhow!("no default export"))?;
+            let default_obj = default_raw.to_object(scope);
             let fk = v8::String::new(scope, "fetch").unwrap();
-            let fetch_value = default
-                .get(scope, fk.into())
-                .ok_or_else(|| anyhow!("no fetch"))?;
+            // A Code Mode worker may export only named Durable Object classes
+            // and no default export at all; its classes dispatch through the
+            // loader ops and its HTTP path never runs. Synthesize a 404 fetch
+            // for such a worker instead of failing the load (upstream workerd
+            // also admits default-less Code Mode workers).
+            let (default, fetch_value) = if is_loader_script && default_obj.is_none() {
+                let obj = v8::Object::new(scope);
+                let not_found =
+                    compile_fn(scope, "() => new Response('Not found', { status: 404 })")?;
+                obj.set(scope, fk.into(), not_found.into());
+                (obj, not_found.into())
+            } else {
+                let default = default_obj.ok_or_else(|| anyhow!("default not object"))?;
+                let fetch_value = default
+                    .get(scope, fk.into())
+                    .ok_or_else(|| anyhow!("no fetch"))?;
+                (default, fetch_value)
+            };
             let default_is_entrypoint =
                 default.is_function() && cell_registry_has(scope, "entrypoints", "default")?;
             let class_fetch = default_is_entrypoint
@@ -7651,6 +7675,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__do_call_cancel" => op_do_call_cancel,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
+        "__stub_bridge" => op_stub_bridge,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -8285,6 +8310,11 @@ fn op_svc_rpc(
     let entrypoint = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
+    let props_json = if args.get(4).is_null_or_undefined() {
+        None
+    } else {
+        Some(args.get(4).to_rust_string_lossy(scope))
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let request = SvcRpcReq {
@@ -8293,6 +8323,7 @@ fn op_svc_rpc(
         entrypoint,
         method,
         args: call_args,
+        props_json,
         reply: tx,
     };
     let id = asyncrt::enqueue(async move {
@@ -8597,11 +8628,12 @@ fn op_loader_load(
         );
     }
     // Plain JSON `env` values merge onto the loaded worker's env; capability
-    // stubs are not yet supported and would fail to serialize upstream in JS.
+    // stubs are lifted to markers by the loader facade before stringify, so
+    // the env survives JSON and revives into stubs on the loaded side.
     let loader_env = code
         .get("env")
         .filter(|v| !v.is_null())
-        .map(|v| v.to_string());
+        .and_then(|v| serde_json::to_string(v).ok());
     if let Some(env) = &loader_env {
         if env.len() > MAX_DYNAMIC_WORKER_ENV_SIZE {
             return loader_throw(
@@ -8848,6 +8880,7 @@ fn op_loader_rpc(
             entrypoint,
             method,
             args: call_args,
+            props_json: None,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
@@ -9283,6 +9316,40 @@ fn op_rpc_call(
         name,
         method,
         args,
+        reply: tx,
+    };
+    let id = asyncrt::enqueue(async move {
+        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
+        match rx.await {
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+            Ok(Ok(RpcData::Json(_))) => Err("RPC answered JSON to a structured-clone call".into()),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("RPC proxy dropped: {e}")),
+        }
+    });
+    let p = promise_for(scope, id);
+    rv.set(p);
+}
+
+/// A stub entry living in another isolate: route the op to the cell that
+/// owns the entry, whose harness resolves it and runs it against the target
+/// (see `__stubBridgeInvoke`). The payload is pre-encoded tagged RPC bytes,
+/// so the op stays a pure transport hop.
+fn op_stub_bridge(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let method = args.get(2).to_rust_string_lossy(scope);
+    let payload = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = RpcCallReq {
+        scope: cell,
+        name: None,
+        method,
+        args: payload,
         reply: tx,
     };
     let id = asyncrt::enqueue(async move {

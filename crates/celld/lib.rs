@@ -470,6 +470,7 @@ pub enum WorkerJob {
         entrypoint: String,
         method: String,
         args: Vec<u8>,
+        props_json: Option<String>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     Queue {

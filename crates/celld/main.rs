@@ -2538,6 +2538,7 @@ async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
                     call.entrypoint,
                     call.method,
                     call.args,
+                    call.props_json,
                 )
                 .await
         }

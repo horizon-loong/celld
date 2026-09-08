@@ -2105,9 +2105,13 @@ class DurableObjectFacets {
         if (path.length !== 1)
           throw new Error(
             "Pipelined property paths on facets are not supported yet.");
-        return __rpcDes(await __facet_rpc(
+        const t0 = Date.now();
+        console.error(`[celld-dbg] facet call START ${path[0]}`);
+        const result = __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          JSON.stringify(props ?? null), path[0], __rpcOut(args, false)));
+          JSON.stringify(props ?? null), path[0], __rpcOut(args, true)));
+        console.error(`[celld-dbg] facet call END ${path[0]} in ${Date.now() - t0}ms`);
+        return result;
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -2132,10 +2136,21 @@ class DurableObjectFacets {
       });
     };
     record.stub = new Proxy(target, {
+      has: (_b, prop) => {
+        if (typeof prop === "string" &&
+            prop !== "name" && prop !== "constructor" && prop !== "then" &&
+            prop !== "toString" && prop !== "valueOf" && prop !== "length" &&
+            prop !== "inspect") {
+          return true;
+        }
+        return Reflect.has(_b, prop);
+      },
       get(base, prop) {
         if (prop === "then") return undefined;
         if (Reflect.has(base, prop)) return Reflect.get(base, prop);
         if (typeof prop !== "string") return undefined;
+        const probe = __probeLocal(prop);
+        if (probe !== null) return probe;
         return __makeNode(session, [prop], null);
       },
     });
@@ -2490,10 +2505,18 @@ const __currentActorEvent = () => {
   }
   return undefined;
 };
-const __currentActorScope = () => __currentActorEvent()?.scope ?? "";
+// The cell this isolate most recently served: capnweb-style WebSocket
+// dispatches can run RPC continuations after the actor event ended, and
+// a stub lift in that continuation still belongs to the WS cell. The
+// fallback lets a bridged entry route back to the right owner. A
+// subsequent event for another cell overwrites it before any of its
+// continuations can lift, so the window is the gap between events.
+let __lastActorScope = "";
+const __currentActorScope = () => __currentActorEvent()?.scope ?? __lastActorScope;
 const __beginActorEvent = (scope) => {
   const event = { scope, context: String(__io_context_id()) };
   __actorEventStack.push(event);
+  __lastActorScope = scope;
   return event;
 };
 const __endActorEvent = (event) => {
@@ -2755,7 +2778,7 @@ globalThis.__makeLoader = () => {
             "yet.");
         const id = await idPromise;
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false)));
+          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, true)));
       })(),
     };
     return new Proxy(target, {
@@ -2820,6 +2843,17 @@ globalThis.__makeLoader = () => {
     Promise.resolve().then(getCode)
       .then((c) => {
         const { config, wasm } = encodeModules(c);
+        // Env capability stubs must survive JSON.stringify: lift them to
+        // markers first, so the loaded worker's env revive can rebuild them
+        // (locally, or bridged when the loader and the loaded worker are
+        // different isolates).
+        if (config.env !== undefined && config.env !== null &&
+            typeof config.env === "object") {
+          const lifted = __stubLift(config.env);
+          if (lifted !== null && lifted.tree !== null) {
+            config.env = lifted.tree;
+          }
+        }
         return __loader_load(JSON.stringify(config), wasm);
       });
   return {
@@ -3181,6 +3215,19 @@ const __releasedStubError = () => new Error(
   "The Durable Object that returned this RPC stub no longer runs on " +
   "this node.");
 const __disposeStub = (meta) => {
+  if (meta.foreign) {
+    if (meta.disposed) return;
+    if (--meta.refs > 0) return;
+    meta.disposed = true;
+    __ctxUnregister(meta);
+    // Release the owning entry's reference; a dropped bridge can leak
+    // nothing here because the entry outlives its target by refcount.
+    __stub_bridge(
+      meta.scope, meta.entryId, "__celld$stub:dispose",
+      __rpcOut([meta.entryId], false),
+    ).catch(() => {});
+    return;
+  }
   if (meta.disposed) return;
   meta.disposed = true;
   __ctxUnregister(meta);
@@ -3196,6 +3243,23 @@ const __stubDisposedError = () =>
 // Shared brand value for RpcTarget instances; see the RpcTarget
 // constructor.
 const __rpcNoClone = () => {};
+// V8/JS introspection probes: bind() reads `name`/`length`; String()/typeof
+// checks read `valueOf`/`toString`; JSON.stringify reads `toJSON`. They must
+// resolve locally on every RPC surface — stub, pipeline node, entrypoint —
+// exactly like Workerd's JsRpcProperty, so they never travel the wire as
+// methods (the receiver would walk "name" as a method and fail with
+// "does not implement the method"). Returns null when `prop` is not a probe.
+const __probeLocal = (prop) => {
+  switch (prop) {
+    case "name": return undefined;
+    case "length": return 0;
+    case "valueOf": return Function.prototype.valueOf;
+    case "toString": return Function.prototype.toString;
+    case "constructor": return Function;
+    case "toJSON": return undefined;
+    default: return null;
+  }
+};
 // Workerd method-visibility rules by target kind: an RpcTarget
 // exposes inherited methods/accessors (never own instance state,
 // never Object.prototype); a plain object or function exposes own
@@ -3210,12 +3274,14 @@ const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
   if (target instanceof __cf.RpcTarget) {
-    if (Object.hasOwn(target, prop) || !(prop in target) ||
-        prop in Object.prototype) throw __rpcNoSuchMethod(prop);
+    if (Object.hasOwn(target, prop) || prop in Object.prototype)
+      throw __rpcNoSuchMethod(prop);
   } else if (!Object.hasOwn(target, prop)) {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
+  if (value === undefined)
+    throw __rpcNoSuchMethod(prop);
   // Keep celld's own stubs and pipeline nodes unwrapped because the wrapper
   // would lose their metadata.
   return typeof value === "function" && !__stubMeta.has(value) &&
@@ -3342,19 +3408,24 @@ const __stubLift = (value) => {
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
       const marker = { "__celld$stub": meta.entry.id,
-                       t: __stubIsolate, c: meta.callable };
+                       t: __stubIsolate, c: meta.callable,
+                       s: meta.entry.scope };
       seen.set(v, marker);
       return marker;
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
+      console.error(`[celld-dbg] lift svc marker: name=${svc.name}`);
       // A loopback service stub (ctx.exports): name + props cross
       // as plain data and revive as a fresh loopback stub. Props
       // are lifted too — they may nest further stubs (Workerd's
-      // nested channel tokens).
+      // nested channel tokens). `s`/`c` let a foreign isolate bridge
+      // calls through the owning script's service channel.
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      const marker = { "__celld$svc": svc.name, t: __stubIsolate,
+                       s: __currentActorScope() || undefined,
+                       c: __cell.script };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
@@ -3379,9 +3450,15 @@ const __stubLift = (value) => {
       try {
         if (typeof held.dup === "function") held = held.dup();
       } catch {}
-      const marker = { "__celld$stub": __newEntry(held).id,
+      let entry = __newEntry(held);
+      console.error(`[celld-dbg] lift stub entry: callable=${typeof v === "function"}`);
+      const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
-                       c: typeof v === "function" };
+                       c: typeof v === "function",
+                       // owning cell scope: lets a foreign isolate bridge
+                       // calls back through the cell's RPC surface.
+                       s: entry.scope };
+      console.error(`[celld-dbg] lift marker: id=${entry.id} scope=${entry.scope}`);
       seen.set(v, marker);
       return marker;
     }
@@ -3574,8 +3651,29 @@ const __stubRevive = (value) => {
     if (v === null || typeof v !== "object") return v;
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
+      console.error(`[celld-dbg] revive stub: id=${stubId} tMatch=${v.t === __stubIsolate} s=${JSON.stringify(v.s)}`);
       const entry = v.t === __stubIsolate
         ? __stubEntries.get(stubId) : undefined;
+      if (entry === undefined && typeof v.s === "string" && v.s !== "") {
+        // The entry lives in another isolate (a loaded worker, or the
+        // worker that loaded it). Bridge every call back through the
+        // owning cell's RPC surface, recursively: stubs that cross in
+        // either direction bridge the same way.
+        console.error(`[celld-dbg] revive bridge: id=${stubId} scope=${v.s}`);
+        const meta = {
+          entry: null,
+          foreign: true,
+          scope: v.s,
+          entryId: stubId,
+          callable: v.c === true,
+          disposed: false,
+          ctx: undefined,
+          refs: 1,
+        };
+        const stub = __makeBridgeStub(meta);
+        __stubMeta.set(stub, meta);
+        return stub;
+      }
       const stub = entry === undefined
         ? __foreignStub()
         : __makeStub(entry, v.c);
@@ -3587,7 +3685,16 @@ const __stubRevive = (value) => {
     if (svcName !== undefined)
       return v.t === __stubIsolate
         ? __entrypointStub(svcName, revive(v.p))
-        : __foreignStub();
+        : (typeof v.c === "string" && v.c !== ""
+            // The foreign svc bridge routes through the owning script's
+            // service channel (__svc_rpc → script, entrypoint, method),
+            // so only the script name is required — no owning scope. A
+            // stateless isolate (executeCode, loaded workers) has no
+            // actor scope, and `s` is undefined there; requiring it
+            // turned the stub into __foreignStub() and silently dropped
+            // every reportMove/askMove callback.
+            ? __makeForeignSvcStub(v.c, svcName, v.p)
+            : __foreignStub());
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
       const namespace = __cell.makeNamespace(doClass);
@@ -3632,6 +3739,9 @@ const __stubRevive = (value) => {
   };
   return { value: revive(value), handles, disposers };
 };
+// Exposed for build_env: a loaded worker's env arrives as JSON marker
+// objects, so the env builder revives stubs through this helper.
+globalThis.__celldStubRevive = (value) => __stubRevive(value).value;
 // A marker that crossed an isolate boundary: fail on use, loudly.
 const __foreignStub = () => new Proxy(function () {}, {
   get: (_b, prop) => {
@@ -3654,10 +3764,19 @@ const __entrypointResolve = (inst, prop) => {
   if (__entrypointReserved.has(prop))
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
-  if (Object.hasOwn(inst, prop) || !(prop in inst) ||
-      prop in Object.prototype)
+  if (Object.hasOwn(inst, prop) || prop in Object.prototype) {
+    console.error(`[celld-dbg] entrypointResolve fail: prop=${prop} ` +
+      `own=${Object.hasOwn(inst, prop)} inObjProto=${prop in Object.prototype} ` +
+      `instCtor=${inst?.constructor?.name}`);
     throw __rpcNoSuchMethod(prop);
+  }
+  // Workerd resolves methods through the Get trap: a constructor-returned
+  // Proxy (Cloudflare's dynamic-stub pattern) answers methods dynamically,
+  // and `in` would bypass it. An undefined Get result is the equivalent of
+  // the missing `in` for plain instances.
   const value = inst[prop];
+  if (value === undefined)
+    throw __rpcNoSuchMethod(prop);
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
       !(value instanceof __cf.RpcProperty)
@@ -3678,6 +3797,11 @@ const __walkable = (v) =>
 // path walked so far, as Workerd's do. A stub mid-walk continues
 // against its own target, in the stub's owning context.
 const __rpcWalk = async (root, path, args, entrypointRoot) => {
+  if (path.some((p) => p === "name")) {
+    console.error(`[celld-dbg] rpcWalk: path=${JSON.stringify(path)} ` +
+      `rootCtor=${root?.constructor?.name} entrypointRoot=${entrypointRoot}\n` +
+      new Error().stack);
+  }
   let value = root;
   for (let i = 0; i < path.length; i++) {
     const meta = __stubMeta.get(value);
@@ -3720,6 +3844,9 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 // Params received by the target are disposed when the op ends
 // (Workerd's param-disposal rule).
 const __stubOp = (meta, path, args) => {
+  if (meta.foreign) {
+    return __stubBridge(meta, path, args);
+  }
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
   // The cell that minted this stub left residency, so `entry.target`
@@ -3878,6 +4005,8 @@ const __makeNode = (session, path, ctx) => {
       if (p === "finally")
         return (onDone) => value().finally(onDone);
       if (typeof p !== "string") return undefined;
+      const probe = __probeLocal(p);
+      if (probe !== null) return probe;
       if (path.length >= 5120)
         throw new TypeError(
           "RPC pipelined property chain is too deep.");
@@ -3903,6 +4032,15 @@ const __makeStub = (entry, callable) => {
   __ctxRegister(meta);
   const stub = new Proxy(function () {}, {
     getPrototypeOf: () => __cf.RpcStub.prototype,
+    has: (_b, prop) => {
+      if (typeof prop === "string" &&
+          prop !== "name" && prop !== "constructor" && prop !== "then" &&
+          prop !== "toString" && prop !== "valueOf" && prop !== "length" &&
+          prop !== "inspect") {
+        return true;
+      }
+      return Reflect.has(_b, prop);
+    },
     get: (_b, prop) => {
       if (prop === "then") return undefined;
       if (prop === Symbol.dispose) return () => __disposeStub(meta);
@@ -3931,6 +4069,86 @@ const __makeStub = (entry, callable) => {
   __stubMeta.set(stub, meta);
   return stub;
 };
+// A stub whose entry lives in another isolate: every op bridges
+// back through the owning cell's RPC surface (see __stubBridgeInvoke
+// in the receiver and the __stub_bridge op in Rust). The local meta
+// refcounts so a dup()ed handle and its source share one remote ref;
+// the owning entry's ref is released when the last local handle goes.
+const __makeBridgeStub = (meta) => {
+  __ctxRegister(meta);
+  const stub = new Proxy(function () {}, {
+    getPrototypeOf: () => __cf.RpcStub.prototype,
+    has: (_b, prop) => {
+      if (typeof prop === "string" &&
+          prop !== "name" && prop !== "constructor" && prop !== "then" &&
+          prop !== "toString" && prop !== "valueOf" && prop !== "length" &&
+          prop !== "inspect") {
+        return true;
+      }
+      return Reflect.has(_b, prop);
+    },
+    get: (_b, prop) => {
+      if (prop === "then") return undefined;
+      if (prop === Symbol.dispose) return () => __disposeStub(meta);
+      if (prop === "dup") return () => {
+        if (meta.disposed) throw __stubDisposedError();
+        meta.refs++;
+        return __makeBridgeStub(meta);
+      };
+      if (typeof prop !== "string") return undefined;
+      const probe = __probeLocal(prop);
+      if (probe !== null) return probe;
+      if (prop === "hasOwnProperty" ||
+          prop === "propertyIsEnumerable" ||
+          prop === "toLocaleString") {
+        return Reflect.get(_b, prop, _b);
+      }
+      return __makeNode(__stubSession(meta), [prop], __ctxNow());
+    },
+    apply: (_b, _this, args) => __makeNode(
+      __valueSession(__stubOp(meta, [], args)), [], __ctxNow()),
+  });
+  __stubMeta.set(stub, meta);
+  return stub;
+};
+
+// Bridge one op on a foreign stub: encode [entryId, path, argsSc] and
+// ask the owning cell to run it. The reply is tagged RPC bytes, so the
+// caller decodes with __rpcDes exactly like a local dispatch.
+const __stubBridge = (meta, path, args) => {
+  const argsSc = args === null ? null : __rpcOut(args, true);
+  return __stub_bridge(
+    meta.scope, meta.entryId, "__celld$stub:invoke",
+    __rpcOut([meta.entryId, path, argsSc], false),
+  ).then((reply) => __rpcDes(reply));
+};
+
+// The receiver half, run on the stub's owning isolate when a foreign
+// caller bridges an op. `payload` is [entryId, path, argsSc] decoded
+// from the incoming RPC args.
+const __stubBridgeInvoke = (method, payload) => {
+  console.error(`[celld-dbg] bridge invoke: method=${method}`);
+  if (!Array.isArray(payload)) throw new Error("malformed stub bridge call");
+  const [entryId, path, argsSc] = payload;
+  const entry = __stubEntries.get(entryId);
+  if (entry === undefined)
+    throw new Error("The RPC stub no longer exists on this node.");
+  if (entry.released) throw __releasedStubError();
+  if (method === "__celld$stub:dispose") {
+    __disposeStub({ entry, callable: false, disposed: false, ctx: entry.ctx });
+    return null;
+  }
+  const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  const args = decoded === null ? null : decoded.args;
+  return __stubOp(
+    { entry, callable: false, disposed: false, ctx: entry.ctx },
+    path, args,
+  ).finally(() => {
+    if (decoded !== null)
+      for (const handle of decoded.received) __disposeStub(handle);
+  });
+};
+
 // A loopback service stub for one of this worker's own
 // entrypoints — the ctx.exports surface. Calling the stub itself
 // returns a new stub carrying per-instance props, delivered to
@@ -3962,12 +4180,53 @@ const __entrypointStub = (name, props) => {
       if (typeof prop !== "string") return undefined;
       if (prop === "getRpcMethodForTestOnly")
         return (n) => __makeNode(session, [String(n)], null);
+      const probe = __probeLocal(prop);
+      if (probe !== null) return probe;
       return __makeNode(session, [prop], null);
     },
     apply: (_b, _this, args) =>
       __entrypointStub(name, args[0]?.props),
   });
   __svcMeta.set(stub, { name, props });
+  return stub;
+};
+
+// A service stub whose entrypoint lives in another script: bridge each
+// call through the owning script's service channel (__svc_rpc), exactly
+// like a cross-script service binding in the same node. `propsMarker` is
+// the wire marker tree (not revived): the receiver revives it and
+// constructs the entrypoint instance with those props.
+const __makeForeignSvcStub = (script, name, propsMarker) => {
+  const propsJson = propsMarker === undefined || propsMarker === null
+    ? null
+    : JSON.stringify(propsMarker);
+  const session = {
+    get: () => Promise.reject(new Error(
+      "Awaitable properties on bridged service bindings are not " +
+      "supported yet.")),
+    call: (path, args) => (async () => {
+      console.error(`[celld-dbg] foreignSvc call: script=${script} ` +
+        `name=${name} path=${JSON.stringify(path)}`);
+      if (path.length !== 1)
+        throw new Error(
+          "Pipelined property paths on bridged service bindings are " +
+          "not supported yet.");
+      return __rpcDes(
+        await __svc_rpc(
+          script, name, path[0], __rpcOut(args, true), propsJson));
+    })(),
+  };
+  const stub = new Proxy(function () {}, {
+    getPrototypeOf: () => __cf.ServiceStub.prototype,
+    get: (_b, prop) => {
+      if (prop === "then") return undefined;
+      if (typeof prop !== "string") return undefined;
+      const probe = __probeLocal(prop);
+      if (probe !== null) return probe;
+      return __makeNode(session, [prop], null);
+    },
+  });
+  __svcMeta.set(stub, { name, props: propsMarker });
   return stub;
 };
 // ---- stored stubs ----------------------------------------------
@@ -4536,6 +4795,20 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
       const result = await fn.apply(inst, JSON.parse(args));
       return JSON.stringify(result) ?? "null";
     }
+    // Bridged stub ops from a foreign isolate: resolve the entry here and
+    // run against its target, without touching the cell's RPC surface.
+    if (method.startsWith("__celld$stub:")) {
+      return await __ctxRun(undefined, () => (async () => {
+        const decoded = __rpcDesArgs(args);
+        try {
+          return await __rpcRun(async () => {
+            return __stubBridgeInvoke(method, decoded.args);
+          }, true);
+        } finally {
+          for (const handle of decoded.received) __disposeStub(handle);
+        }
+      })());
+    }
     return await __ctxRun(undefined, () => (async () => {
       const decoded = __rpcDesArgs(args);
       try {
@@ -4839,9 +5112,32 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
 };
 // Cross-isolate and host callers still pass a single method name.
 globalThis.__dispatchEntrypointRpc =
-  (name, path, argsSc, local = false) => __entrypointOp(
-    name, typeof path === "string" ? [path] : path, argsSc, local,
-    undefined);
+  (name, path, argsSc, propsJson = null, local = false) => {
+    console.error(`[celld-dbg] dispatchEntrypointRpc: name=${name} ` +
+      `path=${JSON.stringify(path)} props=${propsJson === null ? "null" : "json"}`);
+    let makeInst;
+    if (propsJson !== null && propsJson !== undefined) {
+      const props = __celldStubRevive(JSON.parse(propsJson));
+      let inst;
+      makeInst = () => {
+        if (inst !== undefined) return inst;
+        const cls = __cell.entrypoints[name];
+        if (typeof cls !== "function")
+          throw new TypeError(
+            "The entrypoint " + name + " cannot carry props.");
+        const ctx = __beginEvent(props);
+        try {
+          inst = new cls(ctx, __cell.env);
+        } finally {
+          __endEvent();
+        }
+        return inst;
+      };
+    }
+    return __entrypointOp(
+      name, typeof path === "string" ? [path] : path, argsSc, local,
+      makeInst);
+  };
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId — so the isolate can be hibernated between messages.
