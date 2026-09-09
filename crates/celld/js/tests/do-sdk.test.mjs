@@ -10,118 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeEnv } from './harness-env.mjs';
-
-// In-memory emulation of the host storage ops the harness calls, with the
-// observable semantics of the Rust side: values are stored as tagged rows
-// ([sentinel, value]) so the harness's unwrap path sees its own protocol;
-// transaction control snapshots and restores the scope map.
-function mockStorage(env, { deleteAllDeletesAlarm = false } = {}) {
-  // The sentinel is an internal const of the harness script; capture it from
-  // inside the context so stored rows carry the exact identity it checks for.
-  const sentinel = env.run('__storedSentinel');
-  const spaces = new Map(); // scope -> Map<key, [sentinel, value]>
-  const alarms = new Map(); // scope -> number
-  const snapshots = new Map(); // savepoint -> Map
-  const space = (scope) => {
-    let m = spaces.get(scope);
-    if (!m) spaces.set(scope, (m = new Map()));
-    return m;
-  };
-  const s = env.sandbox;
-  s.__storage_get = (scope, key, sent) => {
-    const m = spaces.get(scope);
-    return m && m.has(key) ? m.get(key) : [sent];
-  };
-  s.__storage_get_many = (scope, keys, sent) => {
-    const m = spaces.get(scope) ?? new Map();
-    const found = new Map();
-    for (const k of keys) if (m.has(k)) found.set(k, m.get(k));
-    return [sent, found];
-  };
-  s.__storage_queue_put = (scope, key, value) => {
-    space(scope).set(key, [sentinel, value]);
-  };
-  s.__storage_queue_put_many = (scope, entries) => {
-    const m = space(scope);
-    for (const [k, v] of entries) m.set(k, [sentinel, v]);
-  };
-  s.__storage_flush_pending_puts = () => {};
-  s.__storage_put = (scope, key, value) => {
-    space(scope).set(key, [sentinel, value]);
-  };
-  s.__storage_put_serialized = s.__storage_put;
-  s.__storage_delete = (scope, key) => {
-    const m = spaces.get(scope);
-    return m ? m.delete(key) : false;
-  };
-  s.__storage_delete_many = (scope, keys) => {
-    const m = spaces.get(scope);
-    let n = 0;
-    for (const k of keys) if (m.delete(k)) n++;
-    return n;
-  };
-  s.__storage_delete_all = (scope) => {
-    spaces.set(scope, new Map());
-    if (deleteAllDeletesAlarm) alarms.delete(scope);
-  };
-  s.__storage_list = (scope, optionsJson, sent) => {
-    const o = JSON.parse(optionsJson);
-    const m = spaces.get(scope) ?? new Map();
-    let rows = [...m.entries()]
-        .map(([k, v]) => [k, v]).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-    if (o.start !== null && o.start !== undefined)
-      rows = rows.filter(([k]) => k >= o.start);
-    if (o.startAfter !== null && o.startAfter !== undefined)
-      rows = rows.filter(([k]) => k > o.startAfter);
-    if (o.end !== null && o.end !== undefined)
-      rows = rows.filter(([k]) => k <= o.end);
-    if (o.prefix) rows = rows.filter(([k]) => k.startsWith(o.prefix));
-    if (o.reverse) rows.reverse();
-    if (o.limit > 0) rows = rows.slice(0, o.limit);
-    const found = new Map(rows);
-    return [sent, found];
-  };
-  s.__storage_sync = () => {};
-  s.__storage_transaction_control = (scope, op, nested, savepoint) => {
-    if (op === 'start') snapshots.set(savepoint, new Map(space(scope)));
-    else if (op === 'commit') snapshots.delete(savepoint);
-    else if (op === 'rollback' || op === 'rollback_explicit') {
-      const snap = snapshots.get(savepoint);
-      if (snap) spaces.set(scope, new Map(snap));
-      snapshots.delete(savepoint);
-    }
-  };
-  s.__storage_put = (scope, key, value) => {
-    space(scope).set(key, [sentinel, value]);
-  };
-  s.__storage_put_serialized = s.__storage_put;
-  s.__actor_abort = (scope, message) => {
-    const state = env.sandbox.__states && env.sandbox.__states[scope];
-    if (state) state._aborted = true;
-  };
-  s.__storage_cancel_pending_puts = () => 0;
-  s.__storage_sync_list_start = (scope, optionsJson) => {
-    const o = JSON.parse(optionsJson);
-    const m = spaces.get(scope) ?? new Map();
-    let rows = [...m.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-    if (o.prefix) rows = rows.filter(([k]) => k.startsWith(o.prefix));
-    if (o.limit > 0) rows = rows.slice(0, o.limit);
-    return { rows: rows.map(([k, v]) => [k, v]) };
-  };
-  s.__storage_sync_list_next = (cursor, sent) => {
-    return cursor.rows.length > 0 ? cursor.rows.shift() : null;
-  };
-  s.__alarm_set = (scope, t) => alarms.set(scope, t);
-  s.__alarm_get = (scope) => (alarms.has(scope) ? alarms.get(scope) : null);
-  s.__alarm_delete = (scope) => alarms.delete(scope);
-  // The harness asks the flag at load: rebuild storage mocks after deploy.
-  s.__cell.deleteAllDeletesAlarm = deleteAllDeletesAlarm;
-  return {
-    alarm: (scope) => alarms.get(scope),
-    keys: (scope) => [...(spaces.get(scope)?.keys() ?? [])],
-  };
-}
+import { makeEnv, storageTestSetup } from './harness-env.mjs';
 
 function deployCounter(env) {
   env.run(`
@@ -236,15 +125,6 @@ test('namespace.get refuses ids from another namespace; stub carries id and name
 
 // --- DurableObjectStorage ------------------------------------------------------
 
-function storageTestSetup(env, options = {}) {
-  const memory = mockStorage(env, options);
-  env.run(`
-    globalThis.__states = globalThis.__states || {};
-    globalThis.__state = new DurableObjectState('Counter:test-scope');
-    globalThis.__states['Counter:test-scope'] = __state;
-  `);
-  return memory;
-}
 
 test('storage: put/get round-trips values and misses return undefined', async () => {
   const env = makeEnv();

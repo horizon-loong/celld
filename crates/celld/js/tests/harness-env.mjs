@@ -94,3 +94,118 @@ export function makeEnv() {
     vm.runInContext(code, sandbox, { filename: name });
   return env;
 }
+
+
+// Install an in-memory emulation of the host storage ops (tagged rows,
+// snapshot transaction control, per-scope alarms) and create a
+// DurableObjectState for the given scope. Returns { alarm, keys } probes.
+export function storageTestSetup(env, scope = 'Counter:test-scope', options = {}) {
+  const { deleteAllDeletesAlarm = false } = options;
+  const sentinel = env.run('__storedSentinel');
+  const spaces = new Map();
+  const alarms = new Map();
+  const snapshots = new Map();
+  const space = (sc) => {
+    let m = spaces.get(sc);
+    if (!m) spaces.set(sc, (m = new Map()));
+    return m;
+  };
+  const s = env.sandbox;
+  s.__storage_get = (sc, key, sent) => {
+    const m = spaces.get(sc);
+    return m && m.has(key) ? m.get(key) : [sent];
+  };
+  s.__storage_get_many = (sc, keys, sent) => {
+    const m = spaces.get(sc) ?? new Map();
+    const found = new Map();
+    for (const k of keys) if (m.has(k)) found.set(k, m.get(k));
+    return [sent, found];
+  };
+  s.__storage_queue_put = (sc, key, value) => {
+    space(sc).set(key, [sentinel, value]);
+  };
+  s.__storage_queue_put_many = (sc, entries) => {
+    const m = space(sc);
+    for (const [k, v] of entries) m.set(k, [sentinel, v]);
+  };
+  s.__storage_flush_pending_puts = () => {};
+  s.__storage_put = (sc, key, value) => {
+    space(sc).set(key, [sentinel, value]);
+  };
+  s.__storage_put_serialized = s.__storage_put;
+  s.__storage_delete = (sc, key) => {
+    const m = spaces.get(sc);
+    return m ? m.delete(key) : false;
+  };
+  s.__storage_delete_many = (sc, keys) => {
+    const m = spaces.get(sc);
+    let n = 0;
+    for (const k of keys) if (m.delete(k)) n++;
+    return n;
+  };
+  s.__storage_delete_all = (sc) => {
+    spaces.set(sc, new Map());
+    if (deleteAllDeletesAlarm) alarms.delete(sc);
+  };
+  s.__storage_list = (sc, optionsJson, sent) => {
+    const o = JSON.parse(optionsJson);
+    const m = spaces.get(sc) ?? new Map();
+    let rows = [...m.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    if (o.start !== null && o.start !== undefined)
+      rows = rows.filter(([k]) => k >= o.start);
+    if (o.startAfter !== null && o.startAfter !== undefined)
+      rows = rows.filter(([k]) => k > o.startAfter);
+    if (o.end !== null && o.end !== undefined)
+      rows = rows.filter(([k]) => k <= o.end);
+    if (o.prefix) rows = rows.filter(([k]) => k.startsWith(o.prefix));
+    if (o.reverse) rows.reverse();
+    if (o.limit > 0) rows = rows.slice(0, o.limit);
+    const found = new Map(rows);
+    return [sent, found];
+  };
+  s.__storage_sync = () => {};
+  s.__storage_transaction_control = (sc, op, nested, savepoint) => {
+    if (op === 'start') snapshots.set(savepoint, new Map(space(sc)));
+    else if (op === 'commit') snapshots.delete(savepoint);
+    else if (op === 'rollback' || op === 'rollback_explicit') {
+      const snap = snapshots.get(savepoint);
+      if (snap) spaces.set(sc, new Map(snap));
+      snapshots.delete(savepoint);
+    }
+  };
+  s.__storage_cancel_pending_puts = () => 0;
+  s.__storage_sync_list_start = (sc, optionsJson) => {
+    const o = JSON.parse(optionsJson);
+    const m = space(sc) ?? new Map();
+    let rows = [...m.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    if (o.prefix) rows = rows.filter(([k]) => k.startsWith(o.prefix));
+    if (o.limit > 0) rows = rows.slice(0, o.limit);
+    return { rows: rows.map(([k, v]) => [k, v]) };
+  };
+  s.__storage_sync_list_next = (cursor) =>
+    cursor.rows.length > 0 ? cursor.rows.shift() : null;
+  s.__alarm_set = (sc, t) => alarms.set(sc, t);
+  s.__alarm_get = (sc) => (alarms.has(sc) ? alarms.get(sc) : null);
+  s.__alarm_delete = (sc) => alarms.delete(sc);
+  s.__cell.deleteAllDeletesAlarm = deleteAllDeletesAlarm;
+  // Expose the state as `__state` for snippets (and register it under the
+  // scope so host-side state lookups in tests can find it).
+  env.run(`
+    globalThis.__state = new DurableObjectState('${scope}');
+    globalThis.__states = globalThis.__states || {};
+    globalThis.__states['${scope}'] = __state;
+  `);
+  return {
+    alarm: (sc) => alarms.get(sc),
+    keys: (sc) => [...(spaces.get(sc)?.keys() ?? [])],
+  };
+}
+
+export function makeState(env, scope = 'Counter:test-scope') {
+  return env.run(`
+    globalThis.__states = globalThis.__states || {};
+    __state = new DurableObjectState('${scope}');
+    globalThis.__states['${scope}'] = __state;
+    __state;
+  `);
+}
