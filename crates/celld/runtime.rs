@@ -40,9 +40,11 @@ const REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// blocking run loop's own cap, which exists for the same reason: a client
 /// disconnect is raised on another thread and has nothing to wake this one.
 const CANCELLATION_TICK: Duration = Duration::from_millis(10);
-/// horizon-loong fork: cap for the background-poll backoff in the cell drive
-/// loop (10ms eager start, doubling to this cap).
-const MAX_BACKGROUND_POLL: Duration = Duration::from_millis(500);
+/// horizon-loong fork: safety-net cadence for a background-pending event
+/// whose continuation has not enqueued an op. Wakeup is event-driven (the
+/// spawn notifier); this tick only catches resumptions no host enqueue can
+/// announce, so it can be slow.
+const BACKGROUND_POLL_FALLBACK: Duration = Duration::from_millis(250);
 const CLEAN_RELOAD_MARKER: &str = ".clean-reload.json";
 /// Cell fetches that one target can hold before celld refuses excess work.
 ///
@@ -2767,17 +2769,9 @@ async fn drive_affiliated_inner(
         timing.answered(&entry);
     }
 
-    // horizon-loong fork: a background-only event (reply answered, waitUntil
-    // work pending, no adopted ops yet) is woken by polling, because its
-    // continuations can spawn ops with nothing else to wake the driver. Poll
-    // eagerly at first so chains stay low-latency, then back off so a
-    // long-lived background event costs a handful of isolate entries per
-    // second rather than a busy loop.
-    let mut poll_delay = CANCELLATION_TICK;
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await {
+        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
-                poll_delay = CANCELLATION_TICK;
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
             }
@@ -2869,11 +2863,10 @@ async fn wake_with_cross_entry_gate(
     ops: &mut Ops,
     entry: &mut js::InFlight,
     budget: Duration,
-    poll_delay: &mut Duration,
 ) -> Wake {
     let wait = entry.prepare_cross_entry_gate_wait();
     match wait
-        .wait(wake(ops, entry, budget, poll_delay), |wake| matches!(wake, Wake::Idle))
+        .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
         .await
     {
         js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
@@ -2881,12 +2874,7 @@ async fn wake_with_cross_entry_gate(
     }
 }
 
-async fn wake(
-    ops: &mut Ops,
-    entry: &mut js::InFlight,
-    budget: Duration,
-    poll_delay: &mut Duration,
-) -> Wake {
+async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
     loop {
         let Some(left) = entry.remaining(budget) else {
             // The handler settled, so neither its reply gate nor waitUntil
@@ -2965,8 +2953,17 @@ async fn wake(
                     };
                 }
                 if ops.is_empty() {
-                    asyncrt::sleep(*poll_delay).await;
-                    *poll_delay = (*poll_delay * 2).min(MAX_BACKGROUND_POLL);
+                    // horizon-loong fork: wake on the spawn notifier — the
+                    // background continuation enqueues its next op and the
+                    // notify permit wakes this immediately, so adopting the
+                    // new op costs no latency. The slow tick below is only a
+                    // safety net: a resumption that no host enqueue can
+                    // announce still gets an occasional look.
+                    asyncrt::select_biased! {
+                        "a spawned op wins a tie with the fallback tick";
+                        _ = asyncrt::spawn_notifier().notified() => {}
+                        _ = asyncrt::sleep(BACKGROUND_POLL_FALLBACK) => {}
+                    }
                     if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
                         return cancelled;
                     }
@@ -3473,8 +3470,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
         abort_ops(&mut ops, &mut entry);
     }
     while !entry.finished() {
-            let mut poll_delay = CANCELLATION_TICK;
-    let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await {
+            let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -3927,8 +3923,7 @@ async fn drive_cell_inner(
     }
 
     while !entry.finished() {
-            let mut poll_delay = CANCELLATION_TICK;
-    let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, &mut poll_delay).await
+            let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
         {
             Wake::Op(op, result) => {
                 slot.turn(|worker| {

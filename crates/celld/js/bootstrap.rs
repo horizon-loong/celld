@@ -95,6 +95,16 @@ pub(super) fn install_prelude(scope: &mut v8::PinScope) -> Result<()> {
 }
 
 pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
+    // horizon-loong fork: opt-in RPC debug logging (harness hot-path probes
+    // read globalThis.__celldRpcDebug once at load). Off by default; the
+    // probes are for diagnosing stub-protocol issues and would otherwise
+    // dominate the cell log at one line per RPC.
+    let rpc_debug = std::env::var("CELLD_RPC_DEBUG").is_ok();
+    run_bootstrap_script(
+        scope,
+        "rpc_debug_flag.js",
+        &format!("globalThis.__celldRpcDebug = {rpc_debug};"),
+    )?;
     #[cfg(celld_internal_tests)]
     let harness = include_str!("harness.js")
         .replace(

@@ -32,6 +32,21 @@ thread_local! {
     static SPAWNS: RefCell<Vec<(u64, OpFuture, OpLifetime)>> = const { RefCell::new(Vec::new()) };
 }
 
+// horizon-loong fork: an op enqueued by a background continuation of an
+// event whose reply already went out has no other witness — the driver's
+// adopted set is empty and nothing will enter the isolate to adopt it. The
+// notifier lets `enqueue` announce "the spawn queue gained work" so the
+// driver can wake on the event instead of polling. `Notify` holds one
+// permit, so a notify that races ahead of the waiter is not lost; the
+// woken driver enters the isolate, `finish_turn` adopts whatever drained,
+// and work proceeds with zero added latency.
+static SPAWN_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+/// The notifier an event driver waits on alongside its own adopted ops.
+pub fn spawn_notifier() -> &'static tokio::sync::Notify {
+    SPAWN_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
 struct ProductionDomain {
     owner: Arc<ProductionDomainOwner>,
     services: Arc<HostServices>,
@@ -469,6 +484,9 @@ fn enqueue_with_lifetime<T: Into<OpOut>>(
         .fetch_add(1, Ordering::Relaxed);
     let future: OpFuture = Box::pin(async move { future.await.map(Into::into) });
     SPAWNS.with(|spawns| spawns.borrow_mut().push((id, future, lifetime)));
+    // Announce after the push: a waiter that wakes now drains a non-empty
+    // queue. The store is uncontended in the common case (no waiter).
+    spawn_notifier().notify_one();
     id
 }
 

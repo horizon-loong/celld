@@ -2,6 +2,12 @@
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
 // JavaScript program and belongs in a .js file, like the rest of src/js/.
+// horizon-loong fork: hot-path RPC diagnostics, off unless the host set
+// globalThis.__celldRpcDebug before this file loaded (CELLD_RPC_DEBUG).
+// One line per RPC otherwise dominates the cell log.
+const __rpcDebugLog = globalThis.__celldRpcDebug === true
+  ? (...args) => console.error(...args)
+  : () => {};
 function __bodyBytes(body) {
   if (body == null) return new Uint8Array();
   if (body && body.__celldBodyBytes instanceof Uint8Array)
@@ -2106,11 +2112,11 @@ class DurableObjectFacets {
           throw new Error(
             "Pipelined property paths on facets are not supported yet.");
         const t0 = Date.now();
-        console.error(`[celld-dbg] facet call START ${path[0]}`);
+        __rpcDebugLog(`[celld-dbg] facet call START ${path[0]}`);
         const result = __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
           JSON.stringify(props ?? null), path[0], __rpcOut(args, true)));
-        console.error(`[celld-dbg] facet call END ${path[0]} in ${Date.now() - t0}ms`);
+        __rpcDebugLog(`[celld-dbg] facet call END ${path[0]} in ${Date.now() - t0}ms`);
         return result;
       }),
     };
@@ -3415,7 +3421,7 @@ const __stubLift = (value) => {
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
-      console.error(`[celld-dbg] lift svc marker: name=${svc.name}`);
+      __rpcDebugLog(`[celld-dbg] lift svc marker: name=${svc.name}`);
       // A loopback service stub (ctx.exports): name + props cross
       // as plain data and revive as a fresh loopback stub. Props
       // are lifted too — they may nest further stubs (Workerd's
@@ -3451,14 +3457,14 @@ const __stubLift = (value) => {
         if (typeof held.dup === "function") held = held.dup();
       } catch {}
       let entry = __newEntry(held);
-      console.error(`[celld-dbg] lift stub entry: callable=${typeof v === "function"}`);
+      __rpcDebugLog(`[celld-dbg] lift stub entry: callable=${typeof v === "function"}`);
       const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
                        c: typeof v === "function",
                        // owning cell scope: lets a foreign isolate bridge
                        // calls back through the cell's RPC surface.
                        s: entry.scope };
-      console.error(`[celld-dbg] lift marker: id=${entry.id} scope=${entry.scope}`);
+      __rpcDebugLog(`[celld-dbg] lift marker: id=${entry.id} scope=${entry.scope}`);
       seen.set(v, marker);
       return marker;
     }
@@ -3651,7 +3657,7 @@ const __stubRevive = (value) => {
     if (v === null || typeof v !== "object") return v;
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
-      console.error(`[celld-dbg] revive stub: id=${stubId} tMatch=${v.t === __stubIsolate} s=${JSON.stringify(v.s)}`);
+      __rpcDebugLog(`[celld-dbg] revive stub: id=${stubId} tMatch=${v.t === __stubIsolate} s=${JSON.stringify(v.s)}`);
       const entry = v.t === __stubIsolate
         ? __stubEntries.get(stubId) : undefined;
       if (entry === undefined && typeof v.s === "string" && v.s !== "") {
@@ -3659,7 +3665,7 @@ const __stubRevive = (value) => {
         // worker that loaded it). Bridge every call back through the
         // owning cell's RPC surface, recursively: stubs that cross in
         // either direction bridge the same way.
-        console.error(`[celld-dbg] revive bridge: id=${stubId} scope=${v.s}`);
+        __rpcDebugLog(`[celld-dbg] revive bridge: id=${stubId} scope=${v.s}`);
         const meta = {
           entry: null,
           foreign: true,
@@ -3765,7 +3771,7 @@ const __entrypointResolve = (inst, prop) => {
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
   if (Object.hasOwn(inst, prop) || prop in Object.prototype) {
-    console.error(`[celld-dbg] entrypointResolve fail: prop=${prop} ` +
+    __rpcDebugLog(`[celld-dbg] entrypointResolve fail: prop=${prop} ` +
       `own=${Object.hasOwn(inst, prop)} inObjProto=${prop in Object.prototype} ` +
       `instCtor=${inst?.constructor?.name}`);
     throw __rpcNoSuchMethod(prop);
@@ -3798,7 +3804,7 @@ const __walkable = (v) =>
 // against its own target, in the stub's owning context.
 const __rpcWalk = async (root, path, args, entrypointRoot) => {
   if (path.some((p) => p === "name")) {
-    console.error(`[celld-dbg] rpcWalk: path=${JSON.stringify(path)} ` +
+    __rpcDebugLog(`[celld-dbg] rpcWalk: path=${JSON.stringify(path)} ` +
       `rootCtor=${root?.constructor?.name} entrypointRoot=${entrypointRoot}\n` +
       new Error().stack);
   }
@@ -4116,7 +4122,7 @@ const __makeBridgeStub = (meta) => {
 // ask the owning cell to run it. The reply is tagged RPC bytes, so the
 // caller decodes with __rpcDes exactly like a local dispatch.
 const __stubBridge = (meta, path, args) => {
-  console.error(`[celld-dbg] stub bridge send: entryId=${meta.entryId} ` +
+  __rpcDebugLog(`[celld-dbg] stub bridge send: entryId=${meta.entryId} ` +
     `path=${JSON.stringify(path)} argsNull=${args === null}`);
   const argsSc = args === null ? null : __rpcOut(args, true);
   return __stub_bridge(
@@ -4129,7 +4135,7 @@ const __stubBridge = (meta, path, args) => {
 // caller bridges an op. `payload` is [entryId, path, argsSc] decoded
 // from the incoming RPC args.
 const __stubBridgeInvoke = (method, payload) => {
-  console.error(`[celld-dbg] bridge invoke: method=${method}`);
+  __rpcDebugLog(`[celld-dbg] bridge invoke: method=${method}`);
   if (!Array.isArray(payload)) throw new Error("malformed stub bridge call");
   const [entryId, path, argsSc] = payload;
   const entry = __stubEntries.get(entryId);
@@ -4218,7 +4224,7 @@ const __makeForeignSvcStub = (script, name, propsMarker) => {
       "Awaitable properties on bridged service bindings are not " +
       "supported yet.")),
     call: (path, args) => (async () => {
-      console.error(`[celld-dbg] foreignSvc call: script=${script} ` +
+      __rpcDebugLog(`[celld-dbg] foreignSvc call: script=${script} ` +
         `name=${name} path=${JSON.stringify(path)}`);
       if (path.length !== 1)
         throw new Error(
@@ -4412,7 +4418,7 @@ const __rpcOut = (value, lift) => {
 // A callee exception as tagged bytes: the Error crosses by value
 // (V8 serializes Error natively), custom own properties beside it.
 const __rpcErrOut = (error) => {
-  console.error("[celld-dbg] RPC error reply: " + (error?.stack ?? error));
+  __rpcDebugLog("[celld-dbg] RPC error reply: " + (error?.stack ?? error));
   // `name` rides in the props: V8 only round-trips the standard
   // Error subclass names, and e.g. DataCloneError must survive.
   const props = error instanceof Error
@@ -5142,7 +5148,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
 // Cross-isolate and host callers still pass a single method name.
 globalThis.__dispatchEntrypointRpc =
   (name, path, argsSc, propsJson = null, local = false) => {
-    console.error(`[celld-dbg] dispatchEntrypointRpc: name=${name} ` +
+    __rpcDebugLog(`[celld-dbg] dispatchEntrypointRpc: name=${name} ` +
       `path=${JSON.stringify(path)} props=${propsJson === null ? "null" : "json"}`);
     let makeInst;
     if (propsJson !== null && propsJson !== undefined) {
