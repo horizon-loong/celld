@@ -10206,7 +10206,16 @@ fn op_timer(
     let ms = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as u64;
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
     timer_cancels().lock().unwrap().insert(timer_id, cancel_tx);
-    let id = asyncrt::enqueue(async move {
+    // horizon-loong fork: an IoContext-lifetime op, not a handler op. A timer
+    // armed by a background continuation (a waitUntil'd agent turn calling
+    // scheduler.wait() — which the harness backs with setTimeout) was dropped
+    // the moment its hosting event's turn ended: the sleep never resolved,
+    // and the awaiting Promise.race hung forever with no error and no CPU.
+    // This is the same defect class op_svc_rpc/op_stub_bridge carried before
+    // d956e55. The io_context lifetime is what keeps_native_ops honors, and
+    // it matches workerd, where a pending timer keeps the request's context
+    // alive.
+    let id = asyncrt::enqueue_io_context(async move {
         crate::asyncrt::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
             _ = &mut cancel_rx => {}
