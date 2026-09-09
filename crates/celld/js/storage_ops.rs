@@ -337,7 +337,12 @@ pub(super) fn op_storage_sync(
             Some(sample.epoch),
         ),
     };
-    let id = asyncrt::enqueue(async move {
+    // An IoContext-lifetime op, not a handler op: a background continuation
+    // (a waitUntil'd agent turn awaiting its persistence barrier) calls
+    // sync() after its hosting event's frame has ended, and a handler op
+    // dropped with that frame leaves the barrier's promise pending forever —
+    // the same orphan family op_timer and the stub bridges hit before.
+    let id = asyncrt::enqueue_io_context(async move {
         egress_gate_verdict(gate)
             .await
             .map_err(|refusal| format!("storage.sync: {cell}: {refusal}"))?;
