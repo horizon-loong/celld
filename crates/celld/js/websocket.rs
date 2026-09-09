@@ -1144,7 +1144,7 @@ pub(super) fn op_ws_upgrade(
             })
             .is_ok()
     });
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         if !sent {
             return Err("no outbound WebSocket channel".into());
         }
@@ -1251,7 +1251,7 @@ pub(super) fn op_ws_connect(
             })
             .is_ok()
     });
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         if !sent {
             return Err("no outbound WebSocket channel".into());
         }
@@ -1321,7 +1321,7 @@ pub(super) fn op_ws_bind_target(
     // no handshake for JS to await. The task keeps the reply receiver alive
     // until the connector answers. A bind failure drops the pull sender, so
     // `op_ws_next` reports the caller socket as abnormally closed.
-    asyncrt::enqueue(async move {
+    asyncrt::enqueue_io_context(async move {
         if !sent {
             return Err::<String, String>("no outbound WebSocket channel".into());
         }

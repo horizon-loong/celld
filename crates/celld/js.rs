@@ -7902,7 +7902,7 @@ fn op_kv_blob(
     let authority = gate
         .cell_scope()
         .and_then(|cell| storage::activation_epoch(cell).map(|epoch| (cell.to_string(), epoch)));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let (cell, activation_epoch) =
             authority.ok_or_else(|| "KV blob I/O requires active cell storage".to_string())?;
         let request: serde_json::Value =
@@ -8129,7 +8129,7 @@ fn op_queue_dispatch(
             },
         },
     };
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         if request.scope.is_empty() {
             return Err("Queue dispatch requires a cell event".to_string());
         }
@@ -8544,7 +8544,7 @@ fn op_svc_call_impl(
         reply: tx,
     };
     let stream_service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
@@ -8886,7 +8886,7 @@ fn op_loader_fetch(
         .map(|entry| entry.state.clone());
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let stream_service = http_stream_service();
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         // The child's own `IoContext` has an empty egress stack, so nothing
         // inside it gates what it sends onward. Holding the call until the
         // caller's writes are proven makes every effect of the loaded worker
@@ -8984,7 +8984,7 @@ fn op_loader_rpc(
         .get(&id)
         .map(|entry| entry.state.clone());
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         // The same rule as `op_loader_fetch`: the call carries cell state.
         await_egress_gate(gate).await?;
         let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
@@ -9083,7 +9083,7 @@ fn op_facet_rpc(
         .get(&loader)
         .map(|entry| entry.state.clone());
     let trace = current_trace_context(scope);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let loaded = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
         let (slot, facet_scope) = prepare_loaded_facet(
             loaded,
@@ -9176,7 +9176,7 @@ fn op_facet_fetch(
         .map(|entry| entry.state.clone());
     let trace = current_trace_context(scope);
     let stream_service = http_stream_service();
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let loaded = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
         let (slot, facet_scope) = prepare_loaded_facet(
             loaded,
@@ -9240,7 +9240,7 @@ fn op_facet_abort(
         .get(&loader)
         .map(|entry| entry.state.clone());
     let facet_scope = facet_scope(&class_name, &parent_scope, &owner, &name);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let loaded = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
         let slot = loaded_worker_slot(loaded).await?;
         slot.turn(|worker| worker.own_cell(&facet_scope, None))
@@ -9380,7 +9380,7 @@ fn op_do_call_impl(
         parent: current_trace_context(scope),
     };
     let stream_service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
         let result = match rx.await {
             Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
@@ -9432,7 +9432,7 @@ fn op_rpc_call(
         args,
         reply: tx,
     };
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
         match rx.await {
             Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
@@ -9597,7 +9597,7 @@ fn op_fetch(
         (None, None, None)
     };
     let stream_service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         // Held, not disarmed: this op has several early returns, and the guard
         // removes its registry entry on every one of them when it drops. The
         // cancel it sends then reaches a receiver this block already consumed,
@@ -9773,7 +9773,7 @@ fn op_asset_fetch(
             .is_ok()
     });
     let stream_service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         if !sent {
             return Err("no asset resolver channel".to_string());
         }
@@ -10091,7 +10091,7 @@ fn op_http_stream_read(
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let service = http_stream_service();
     let read = http_stream_read(service, stream_id);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         match read.await? {
             Some(bytes) => Ok(asyncrt::OpOut::Bytes(bytes)),
             None => Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into())),
@@ -10186,7 +10186,7 @@ fn op_response_stream_write(
     // direction this gate exists to fail in.
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Response);
     let service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         await_egress_gate(gate).await?;
         response_stream_write(service, stream_id, bytes).await?;
         Ok(String::new())
@@ -10204,7 +10204,7 @@ fn op_response_stream_closed(
         .writer_close_watch(stream_id)
         .map(|(writer, finished)| (Some(writer), Some(finished)))
         .unwrap_or((None, None));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let cancelled = match (writer, finished.as_mut()) {
             (Some(writer), Some(finished)) => crate::asyncrt::select_biased! {
                 "stream completion wins a tie so a completed response is not reported as cancelled";
@@ -10230,7 +10230,7 @@ fn op_response_stream_close(
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let error = args.get(1).to_rust_string_lossy(scope);
     let close = response_stream_close(http_stream_service(), stream_id, error);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         close.await?;
         Ok(String::new())
     });
@@ -10519,7 +10519,7 @@ fn op_gate_wait(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         loop {
             match cell_gate_wait(&cell) {
                 None => return Ok(String::new()),
@@ -12653,7 +12653,7 @@ fn op_queue_alarm_set_wait(
     let Some(gate) = launch_arm_gate(&cell, committed) else {
         return;
     };
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         match gate.await {
             Ok(Ok(())) => Ok(String::new()),
             Ok(Err(error)) => Err(format!("Queue wake-entry gate: {error}")),

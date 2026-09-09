@@ -638,7 +638,7 @@ pub(super) fn op_hr_event(
         .unwrap()
         .get(&id)
         .map(|rewriter| rewriter.event_rx.clone());
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let Some(receiver) = receiver else {
             return Err("HTMLRewriter is gone".to_string());
         };

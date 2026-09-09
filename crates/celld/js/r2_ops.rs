@@ -417,7 +417,7 @@ pub(super) fn op_r2_head(
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let meta = store()?
             .head_blob(&blob_key(&bucket_name, &key))
             .await
@@ -449,7 +449,7 @@ pub(super) fn op_r2_get(
     let request = serde_json::from_str::<GetRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 get options: {error}"));
     let stream_service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let request = request?;
         let range = request
             .range
@@ -493,7 +493,7 @@ pub(super) fn op_r2_delete(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let keys = serde_json::from_str::<Vec<String>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 delete key list: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let keys = keys?;
         let store = store()?;
         let keys = keys
@@ -525,7 +525,7 @@ pub(super) fn op_r2_list(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<ListRequest>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 list options: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let request = request?;
         let store = store()?;
         let limit = match request.limit.unwrap_or(0) {
@@ -674,7 +674,7 @@ pub(super) fn op_r2_put(
     let body = view_bytes(args.get(2));
     let request = serde_json::from_str::<PutRequest>(&args.get(3).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let request = request?;
         let Some(body) = body else {
             return Err("R2 put: the body must be an ArrayBuffer view".to_string());
@@ -872,7 +872,7 @@ pub(super) fn op_r2_put_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let request = request?;
         reap_puts();
         // Fail before a byte moves if there is no bucket at all.
@@ -907,7 +907,7 @@ pub(super) fn op_r2_put_chunk(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let chunk = view_bytes(args.get(1));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let Some(chunk) = chunk else {
             return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
         };
@@ -936,7 +936,7 @@ pub(super) fn op_r2_put_end(
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let abort = args.get(1).boolean_value(scope);
     let put = puts().lock().unwrap().remove(&put_id);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let Some(put) = put else {
             return Err(format!("R2 streaming write {put_id} is not open"));
         };
@@ -1051,7 +1051,7 @@ pub(super) fn op_r2_mp_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart options: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let request = request?;
         reap_uploads();
         // A multipart object carries no md5, on R2 or here, so nothing is
@@ -1096,7 +1096,7 @@ pub(super) fn op_r2_mp_resume(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
     let upload_id = args.get(2).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let parsed = upload_id.parse::<u64>().ok();
         let entry = parsed.and_then(|id| uploads().lock().unwrap().get(&id).cloned());
         let entry = match entry {
@@ -1137,7 +1137,7 @@ pub(super) fn op_r2_mp_part(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let part_number = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
     let bytes = view_bytes(args.get(2));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let Some(bytes) = bytes else {
             return Err(format!(
                 "R2 multipart part {part_number} of upload {upload_id} must be an ArrayBuffer view"
@@ -1200,7 +1200,7 @@ pub(super) fn op_r2_mp_complete(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let claimed = serde_json::from_str::<Vec<u32>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart part list: {error}"));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let claimed = claimed?;
         let Some(entry) = uploads().lock().unwrap().remove(&upload_id) else {
             return Err(format!("R2 multipart upload {upload_id} is not open"));
@@ -1276,7 +1276,7 @@ pub(super) fn op_r2_mp_abort(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let entry = uploads().lock().unwrap().remove(&upload_id);
     let id =
-        asyncrt::enqueue(async move {
+        asyncrt::enqueue_io_context(async move {
             if let Some(entry) = entry {
                 entry.lock().await.upload.abort().await.map_err(|error| {
                     format!("R2 multipart abort of upload {upload_id}: {error}")

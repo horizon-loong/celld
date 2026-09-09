@@ -498,6 +498,15 @@ pub fn enqueue<T: Into<OpOut>>(
 }
 
 /// Register an operation that keeps its `IoContext` alive after the handler ends.
+///
+/// This is the correct lifetime for every JS-visible awaitable host op: a
+/// `waitUntil` continuation calls storage/RPC/fetch/R2/WS/TCP after its
+/// hosting event's frame has ended, and Workerd holds the IoContext for such
+/// an effect until it settles. A handler-lifetime op is dropped with the
+/// frame, leaving the awaiting promise pending forever — the orphan family
+/// fixed across `op_timer`, the stub bridges, `storage.sync`, and (fleet-wide,
+/// by policy) every remaining op site. Handler lifetime remains only for ops
+/// that must die with the frame, i.e. instant stale-gate error rejections.
 pub(crate) fn enqueue_io_context<T: Into<OpOut>>(
     future: impl Future<Output = Result<T, String>> + Send + 'static,
 ) -> u64 {

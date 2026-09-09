@@ -148,7 +148,7 @@ pub(super) fn op_tcp_connect(
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
             .await
             .map_err(|error| {
@@ -184,7 +184,7 @@ pub(super) fn op_tcp_read(
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
     let half = registry().lock().unwrap().get(&id).map(|s| s.read.clone());
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
         let read = guard.as_mut().ok_or("socket is closed")?;
@@ -209,7 +209,7 @@ pub(super) fn op_tcp_write(
         return loader_throw(scope, "socket write needs bytes");
     };
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
         let write = guard.as_mut().ok_or("socket is closed")?;
@@ -233,7 +233,7 @@ pub(super) fn op_tcp_shutdown(
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
         let write = guard.as_mut().ok_or("socket is closed")?;
@@ -276,7 +276,7 @@ pub(super) fn op_tcp_starttls(
     let taken = registry().lock().unwrap().remove(&request.id);
     let new_id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(new_id);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue_io_context(async move {
         let socket = taken.ok_or("socket is closed")?;
         let read = socket.read.lock().await.take().ok_or("socket is closed")?;
         let write = socket.write.lock().await.take().ok_or("socket is closed")?;
