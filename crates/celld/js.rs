@@ -898,9 +898,53 @@ const HTTP_TEE_BRANCH_CAPACITY: usize = 16;
 const RESPONSE_STREAM_CONSUMER_CANCELED: &str = "response stream consumer canceled";
 const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is already in progress";
 enum HttpStreamSource {
-    Response(reqwest::Response),
+    Response {
+        response: reqwest::Response,
+        stats: ResponseStreamStats,
+    },
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
     Stream(HttpChunkStream),
+}
+
+/// Diagnostics for one outbound fetch response body. A bare reqwest error
+/// cannot distinguish a stream cut before its first byte from one that died
+/// mid-flight, which is exactly the difference an operator needs when a
+/// provider's edge starts dropping streams. The stats ride the source, so
+/// both consumption paths report from the same truth.
+struct ResponseStreamStats {
+    url: String,
+    status: u16,
+    registered: Instant,
+    first_chunk: Option<Instant>,
+    chunks: u64,
+    bytes: u64,
+}
+
+impl ResponseStreamStats {
+    fn note_chunk(&mut self, len: usize) {
+        self.first_chunk.get_or_insert_with(Instant::now);
+        self.chunks += 1;
+        self.bytes += len as u64;
+    }
+
+    fn report(&self, error: &reqwest::Error) {
+        let first_chunk_ms = self
+            .first_chunk
+            .map(|at| at.duration_since(self.registered).as_millis() as u64);
+        tracing::warn!(
+            target: "celld",
+            event = "http_response_stream_error",
+            url = %self.url,
+            status = self.status,
+            age_ms = self.registered.elapsed().as_millis() as u64,
+            first_chunk_seen = first_chunk_ms.is_some(),
+            first_chunk_after_ms = first_chunk_ms.unwrap_or(0),
+            chunks = self.chunks,
+            bytes = self.bytes,
+            error = %error,
+            error_debug = ?error,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2923,17 +2967,41 @@ impl CellJob {
 thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
-    static HTTP: reqwest::Client = reqwest::Client::new();
-    static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    static HTTP: reqwest::Client = outbound_http_client(reqwest::redirect::Policy::default());
+    static HTTP_MANUAL: reqwest::Client =
+        outbound_http_client(reqwest::redirect::Policy::none());
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+    static HTTP_ERROR: reqwest::Client = outbound_http_client(
+        reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
-        })).build().unwrap();
+        }),
+    );
     static DO_ID_KEYS: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
+}
+
+/// The outbound fetch client, shared by every redirect policy above.
+///
+/// A connect timeout plus a read timeout bound a black-hole host — the future
+/// settles with `Err` instead of parking the run loop forever — without a
+/// total-duration ceiling on the response: a Worker that consumes a provider's
+/// SSE stream may legitimately keep one fetch alive for many minutes, and a
+/// total `RequestBuilder::timeout` kills exactly that mid-flight
+/// (`reqwest::Error { kind: Body, source: TimedOut }` at the configured cap).
+/// `CELLD_FETCH_TIMEOUT_S` (default 120) bounds how long a fetch may sit
+/// *without receiving bytes*, not how long it may stream.
+fn outbound_http_client(redirect: reqwest::redirect::Policy) -> reqwest::Client {
+    let idle = std::time::Duration::from_secs(
+        crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
+            .expect("validated CELLD_FETCH_TIMEOUT_S"),
+    );
+    reqwest::Client::builder()
+        .redirect(redirect)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(idle)
+        .build()
+        .unwrap()
 }
 
 #[doc(hidden)]
@@ -9558,13 +9626,10 @@ fn op_fetch(
             finish(false, None, Some(error.clone()));
         })?;
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-        // a timeout bounds a black-hole host: the future settles (Err) instead
-        // of parking run_loop forever — the hang the Drop guard can't catch.
-        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-            .expect("validated CELLD_FETCH_TIMEOUT_S");
-        let mut rb = client
-            .request(m, &url)
-            .timeout(std::time::Duration::from_secs(fetch_timeout));
+        // No total-duration timeout on the request: the client's connect and
+        // read timeouts (see `outbound_http_client`) bound a black-hole host
+        // without capping how long an actively streaming body may run.
+        let mut rb = client.request(m, &url);
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
         // `None`. Install the zero length here unless the Worker supplied a
@@ -9637,8 +9702,20 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
+                let url = resp.url().to_string();
+                let stats = ResponseStreamStats {
+                    url,
+                    status,
+                    registered: Instant::now(),
+                    first_chunk: None,
+                    chunks: 0,
+                    bytes: 0,
+                };
                 let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
+                    stream_service.register_source(HttpStreamSource::Response {
+                        response: resp,
+                        stats,
+                    })
                 else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
@@ -9721,11 +9798,17 @@ pub fn take_body_stream(stream_id: u64) -> Result<HttpChunkStream, String> {
 
 async fn next_http_stream_chunk(source: &mut HttpStreamSource) -> Result<Option<Vec<u8>>, String> {
     match source {
-        HttpStreamSource::Response(response) => response
-            .chunk()
-            .await
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
-            .map_err(|error| format!("response stream: {error}")),
+        HttpStreamSource::Response { response, stats } => match response.chunk().await {
+            Ok(Some(bytes)) => {
+                stats.note_chunk(bytes.len());
+                Ok(Some(bytes.to_vec()))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                stats.report(&error);
+                Err(format!("response stream: {error}"))
+            }
+        },
         HttpStreamSource::Receiver(receiver) => match receiver.recv().await {
             Some(Ok(bytes)) => Ok(Some(bytes)),
             Some(Err(error)) => Err(error),
@@ -9847,10 +9930,18 @@ async fn response_stream_close(
 /// needed: the eventual HTTP or JS consumer supplies the backpressure.
 fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
     match source {
-        HttpStreamSource::Response(response) => Box::pin(response.bytes_stream().map(|chunk| {
-            chunk
-                .map(|bytes| bytes.to_vec())
-                .map_err(|error| format!("response stream: {error}"))
+        HttpStreamSource::Response {
+            response,
+            mut stats,
+        } => Box::pin(response.bytes_stream().map(move |chunk| match &chunk {
+            Ok(bytes) => {
+                stats.note_chunk(bytes.len());
+                Ok(bytes.to_vec())
+            }
+            Err(error) => {
+                stats.report(error);
+                Err(format!("response stream: {error}"))
+            }
         })),
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
