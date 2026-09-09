@@ -47,6 +47,10 @@ function mockStorage(env, { deleteAllDeletesAlarm = false } = {}) {
     for (const [k, v] of entries) m.set(k, [sentinel, v]);
   };
   s.__storage_flush_pending_puts = () => {};
+  s.__storage_put = (scope, key, value) => {
+    space(scope).set(key, [sentinel, value]);
+  };
+  s.__storage_put_serialized = s.__storage_put;
   s.__storage_delete = (scope, key) => {
     const m = spaces.get(scope);
     return m ? m.delete(key) : false;
@@ -87,6 +91,26 @@ function mockStorage(env, { deleteAllDeletesAlarm = false } = {}) {
       if (snap) spaces.set(scope, new Map(snap));
       snapshots.delete(savepoint);
     }
+  };
+  s.__storage_put = (scope, key, value) => {
+    space(scope).set(key, [sentinel, value]);
+  };
+  s.__storage_put_serialized = s.__storage_put;
+  s.__actor_abort = (scope, message) => {
+    const state = env.sandbox.__states && env.sandbox.__states[scope];
+    if (state) state._aborted = true;
+  };
+  s.__storage_cancel_pending_puts = () => 0;
+  s.__storage_sync_list_start = (scope, optionsJson) => {
+    const o = JSON.parse(optionsJson);
+    const m = spaces.get(scope) ?? new Map();
+    let rows = [...m.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    if (o.prefix) rows = rows.filter(([k]) => k.startsWith(o.prefix));
+    if (o.limit > 0) rows = rows.slice(0, o.limit);
+    return { rows: rows.map(([k, v]) => [k, v]) };
+  };
+  s.__storage_sync_list_next = (cursor, sent) => {
+    return cursor.rows.length > 0 ? cursor.rows.shift() : null;
   };
   s.__alarm_set = (scope, t) => alarms.set(scope, t);
   s.__alarm_get = (scope) => (alarms.has(scope) ? alarms.get(scope) : null);
@@ -214,7 +238,11 @@ test('namespace.get refuses ids from another namespace; stub carries id and name
 
 function storageTestSetup(env, options = {}) {
   const memory = mockStorage(env, options);
-  env.run(`globalThis.__state = new DurableObjectState('Counter:test-scope');`);
+  env.run(`
+    globalThis.__states = globalThis.__states || {};
+    globalThis.__state = new DurableObjectState('Counter:test-scope');
+    globalThis.__states['Counter:test-scope'] = __state;
+  `);
   return memory;
 }
 
@@ -607,4 +635,129 @@ test('KNOWN GAP: idFromName ids are not privacy-preserving HMACs here', () => {
   // belongs to the differential conformance corpus. Documented, not
   // asserted here.
   assert.ok(true);
+});
+
+// --- Hibernatable WebSocket state API ----------------------------------------
+
+test('state WebSocket hibernation API: accept/get/getTags/auto-response', () => {
+  const env = makeEnv();
+  storageTestSetup(env);
+  env.run(`
+    globalThis.__ws_accept = () => {};
+    globalThis.__ws_bind_target = () => {};
+    globalThis.__heap_over_admission_share = () => false;
+    globalThis.__ws_auto_response_set = (scope, req, res) => {
+      globalThis.__storedAutoResponse = JSON.stringify([req, res]);
+    };
+    globalThis.__ws_auto_response_get = (scope) =>
+      globalThis.__storedAutoResponse ?? null;
+    globalThis.__ws_auto_response_ts = () => null;
+    globalThis.__ws_alloc = () => 'ws1';
+    globalThis.__ws_connect = () => Promise.resolve('');
+    globalThis.__ws_next = () => new Promise(() => {});
+    globalThis.__wait_until = () => {};
+  `);
+  const out = env.run(`(() => {
+    const state = new DurableObjectState('Counter:ws');
+    const ws = new WebSocket('wss://example.com/');
+    state.acceptWebSocket(ws, ['game-1']);
+    globalThis.__ws_list = (scope, tag) => JSON.stringify(
+        [{ id: 'wss://example.com/', tags: ['game-1'] }].filter(
+            (row) => tag === undefined || row.tags.includes(tag)));
+    const sockets = state.getWebSockets();
+    const tagged = state.getWebSockets('game-1');
+    const untagged = state.getWebSockets('other');
+    const tags = state.getTags(ws);
+    state.setWebSocketAutoResponse(
+        new WebSocketRequestResponsePair('ping', 'pong'));
+    const pair = state.getWebSocketAutoResponse();
+    return {
+      count: sockets.length,
+      isWs: String(sockets[0]._id) === 'ws1',
+      taggedCount: tagged.length,
+      untaggedCount: untagged.length,
+      tags,
+      hasPair: pair !== undefined && pair !== null,
+      hibernatable: ws._hibernatable === true,
+    };
+  })()`);
+  assert.equal(out.count, 1);
+  assert.equal(out.isWs, true);
+  assert.equal(out.taggedCount, 1);
+  assert.equal(out.untaggedCount, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(out.tags)), ['game-1']);
+  assert.equal(out.hasPair, true);
+  assert.equal(out.hibernatable, true);
+});
+
+test('state.abort marks the object aborted and notifies the host', async () => {
+  const env = makeEnv();
+  storageTestSetup(env);
+  const calls = [];
+  env.sandbox.__actor_abort = (scope, message) => {
+    calls.push({ scope, message });
+  };
+  const out = await env.run(`(async () => {
+    const state = __state;
+    state.abort('shutting down');
+    let sqlRefused = null;
+    try { state.storage.sql.exec('SELECT 1'); }
+    catch (e) { sqlRefused = /was reset|storage is closed/.test(e.message); }
+    const broken = __brokenActors.get('Counter:test-scope');
+    return { aborted: state._aborted, sqlRefused,
+             brokenMessage: broken && broken.message };
+  })()`);
+  assert.equal(out.aborted, true);
+  assert.equal(out.sqlRefused, true);
+  assert.equal(out.brokenMessage, 'shutting down');
+});
+
+test('storage.kv: sync put/get/delete round-trip', () => {
+  const env = makeEnv();
+  storageTestSetup(env);
+  const out = env.run(`(() => {
+    const kv = __state.storage.kv;
+    kv.put('who', 'celld');
+    const value = kv.get('who');
+    const gone = kv.delete('who');
+    const after = kv.get('who');
+    return { value, gone, after };
+  })()`);
+  assert.equal(out.value, 'celld');
+  assert.equal(out.gone, true);
+  assert.equal(out.after, undefined);
+});
+
+test('storage.kv: list iterates in order and a second list invalidates the first', () => {
+  const env = makeEnv();
+  storageTestSetup(env);
+  const out = env.run(`(() => {
+    const kv = __state.storage.kv;
+    kv.put('b', 2); kv.put('a', 1); kv.put('c', 3);
+    const it1 = kv.list();
+    const first = it1.next().value;            // [key, value]
+    const it2 = kv.list();                      // invalidates it1
+    let invalidated = null;
+    try { it1.next(); } catch (e) { invalidated = /invalidated/.test(e.message); }
+    const rest = [...it2].map(([k]) => k);
+    return { first, invalidated, rest };
+  })()`);
+  assert.equal(out.first[0], 'a');
+  assert.equal(out.invalidated, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(out.rest)), ['a', 'b', 'c']);
+});
+
+// --- ctx.exports (state/ctx loopback surface) ---------------------------------
+
+test('ctx.exports exposes entrypoints and DO namespaces as stubs', () => {
+  const env = makeEnv();
+  deployCounter(env);
+  const out = env.run(`(() => {
+    const ctx = __beginEvent();
+    try {
+      const keys = Object.keys(ctx.exports);
+      return { keys: keys.sort(), hasCounter: 'Counter' in ctx.exports };
+    } finally { __endEvent(); }
+  })()`);
+  assert.ok(out.keys.includes('Counter'));
 });
