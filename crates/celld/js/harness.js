@@ -1516,19 +1516,11 @@ function __readStoredValue(scope, key, read) {
   }
 }
 class SyncKvListIterator {
-  constructor(root, generation, cursor) {
-    this._root = root;
-    this._generation = generation;
+  constructor(cursor) {
     this._cursor = cursor;
   }
   [Symbol.iterator]() { return this; }
   next() {
-    if (this._generation !== this._root._syncKvListGeneration) {
-      throw new Error(
-        "kv.list() iterator was invalidated because a new call to kv.list() was started. " +
-        "Only one kv.list() iterator can exist at a time.",
-      );
-    }
     const value =
       __storage_sync_list_next(this._cursor, __storedSentinel);
     if (value === null) return { done: true, value: undefined };
@@ -1566,13 +1558,14 @@ class SyncKvStorage {
   }
   list(options = {}) {
     this._storage._assertTransactionActive("kv.list");
-    const generation = ++this._root._syncKvListGeneration;
+    // Each list() owns an independent native cursor, so concurrent iterators
+    // coexist (gadget methods overlap with executeCode turns all the time).
+    // Exhausted cursors free themselves (SQLITE_DONE drops them) and the
+    // native layer caps accumulated abandoned cursors.
     const cursor = __storage_sync_list_start(
       this._storage._scope, JSON.stringify(options),
     );
-    return new SyncKvListIterator(
-      this._root, generation, cursor,
-    );
+    return new SyncKvListIterator(cursor);
   }
 }
 class DurableObjectStorage {
@@ -1592,7 +1585,6 @@ class DurableObjectStorage {
     if (!transactionRoot) {
       this._transactionSerial = 0;
       this._transactionTail = Promise.resolve();
-      this._syncKvListGeneration = 0;
       // EXPERIMENT (horizon-loong fork): tracks a live root synchronous
       // transaction on the shared root, so a second transactionSync() on the
       // SAME root object (typed-storage wrappers call ctx.storage directly,

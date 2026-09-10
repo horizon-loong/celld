@@ -3740,8 +3740,21 @@ pub fn sync_list_start(
         }
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))?;
+    // Bound abandoned cursors: an iterator discarded mid-iteration (for..of
+    // break, early return) holds its sqlite statement until the connection
+    // closes. Exhaustion and errors drop cursors immediately; this cap only
+    // catches pathological accumulation, evicting the oldest so a leaked
+    // cursor can never grow without bound.
+    const MAX_SYNC_LIST_CURSORS: usize = 64;
     let id = NEXT_SYNC_LIST_CURSOR.fetch_add(1, Ordering::Relaxed);
-    sync_list_cursors(|cursors| cursors.borrow_mut().insert(id, cursor));
+    sync_list_cursors(|cursors| {
+        let mut cursors = cursors.borrow_mut();
+        while cursors.len() >= MAX_SYNC_LIST_CURSORS {
+            let oldest = *cursors.keys().min().expect("len >= 1 checked");
+            cursors.remove(&oldest);
+        }
+        cursors.insert(id, cursor);
+    });
     Ok(id)
 }
 
