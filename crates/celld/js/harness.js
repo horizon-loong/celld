@@ -1515,19 +1515,6 @@ function __readStoredValue(scope, key, read) {
     throw contextual;
   }
 }
-class SyncKvListIterator {
-  constructor(cursor) {
-    this._cursor = cursor;
-  }
-  [Symbol.iterator]() { return this; }
-  next() {
-    const value =
-      __storage_sync_list_next(this._cursor, __storedSentinel);
-    if (value === null) return { done: true, value: undefined };
-    value[1] = __unwrapStored(value[1]);
-    return { done: false, value };
-  }
-}
 class SyncKvStorage {
   constructor(storage) {
     this._storage = storage;
@@ -1558,14 +1545,24 @@ class SyncKvStorage {
   }
   list(options = {}) {
     this._storage._assertTransactionActive("kv.list");
-    // Each list() owns an independent native cursor, so concurrent iterators
-    // coexist (gadget methods overlap with executeCode turns all the time).
-    // Exhausted cursors free themselves (SQLITE_DONE drops them) and the
-    // native layer caps accumulated abandoned cursors.
+    // Materialize, matching workerd's async list() (which returns a full Map).
+    // A live cursor is bound to the cell's current sqlite connection and dies
+    // with it (replicator capture, epoch swap), so handing one to the caller
+    // meant any await held across iteration -- storage wrappers are
+    // generators, so this happened constantly -- failed with "sync KV cursor
+    // was invalidated". The cursor now lives only inside this synchronous
+    // call; results are bounded by the list `limit`.
     const cursor = __storage_sync_list_start(
       this._storage._scope, JSON.stringify(options),
     );
-    return new SyncKvListIterator(cursor);
+    const entries = [];
+    for (;;) {
+      const value = __storage_sync_list_next(cursor, __storedSentinel);
+      if (value === null) break;
+      value[1] = __unwrapStored(value[1]);
+      entries.push(value);
+    }
+    return entries[Symbol.iterator]();
   }
 }
 class DurableObjectStorage {
