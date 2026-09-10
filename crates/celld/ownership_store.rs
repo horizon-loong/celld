@@ -362,6 +362,8 @@ pub struct BucketOwnership {
     probe_public_key: String,
     live: Arc<LiveLoad>,
     lease_ttl_ms: u64,
+    /// Short-lived cache for the capacity-lease listing (see read_capacity_leases).
+    capacity_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<NodeLeaseWire>)>>,
     /// The shared fleet sample's interval and maximum age, the balancing
     /// interval in production. Placement and recruitment read the sample
     /// through it so a burst of either costs one GET each, not a fleet scan.
@@ -465,6 +467,7 @@ impl BucketOwnership {
             probe_public_key,
             live: Arc::new(LiveLoad::default()),
             lease_ttl_ms: 0,
+            capacity_cache: std::sync::Mutex::new(None),
             fleet_sample_ms: 5_000,
             #[cfg(all(test, celld_internal_tests))]
             ambient_load_override: None,
@@ -588,7 +591,17 @@ impl BucketOwnership {
     }
 
     async fn read_capacity_leases(&self) -> anyhow::Result<Vec<NodeLeaseWire>> {
-        self.read_capacity_lease_bodies()
+        // Cell acquisition pays this listing per unowned cell, and a churning
+        // fleet of short-lived isolates turned that into the node's dominant
+        // idle CPU cost. One second of cache is a fraction of the lease
+        // heartbeat, so nodes appearing or fencing still land promptly.
+        if let Some((at, cached)) = self.capacity_cache.lock().unwrap().as_ref() {
+            if at.elapsed() < std::time::Duration::from_millis(1_000) {
+                return Ok(cached.clone());
+            }
+        }
+        let leases: Vec<NodeLeaseWire> = self
+            .read_capacity_lease_bodies()
             .await?
             .iter()
             .map(|body| {
@@ -600,7 +613,10 @@ impl BucketOwnership {
                     )
                 })
             })
-            .collect()
+            .collect::<anyhow::Result<_>>()?;
+        *self.capacity_cache.lock().unwrap() =
+            Some((std::time::Instant::now(), leases.clone()));
+        Ok(leases)
     }
 
     /// Every live lease record's body, checked to be JSON and nothing more.
